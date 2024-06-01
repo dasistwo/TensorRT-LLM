@@ -73,5 +73,53 @@ inline int compute_occupancy_for_kernel()
     return max_active_blocks;
 }
 
+template <typename GemmKernel, bool enable_cutlass_3x = false>
+inline int compute_occupancy_for_kernel2()
+{
+
+    int smem_size = int(sizeof(typename GemmKernel::SharedStorage));
+
+    if (smem_size > (48 << 10))
+    {
+        cudaFuncAttributes attr;
+        int device = 0;
+        int max_smem_per_block = 0;
+        tensorrt_llm::common::check_cuda_error(cudaGetDevice(&device));
+        tensorrt_llm::common::check_cuda_error(
+            cudaDeviceGetAttribute(&max_smem_per_block, cudaDevAttrMaxSharedMemoryPerBlockOptin, device));
+        if constexpr (enable_cutlass_3x)
+        {
+            tensorrt_llm::common::check_cuda_error(cudaFuncGetAttributes(&attr, cutlass::device_kernel<GemmKernel>));
+        }
+        else
+        {
+            tensorrt_llm::common::check_cuda_error(cudaFuncGetAttributes(&attr, cutlass::Kernel2<GemmKernel>));
+        }
+        if (smem_size + attr.sharedSizeBytes >= static_cast<size_t>(max_smem_per_block))
+        {
+            // This should mean that
+            // cudaFuncSetAttribute(cutlass::Kernel<GemmKernel>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size)
+            // wouldn't work. In that case, we return an occupancy of 0. This will cause the heuristic to ignore this
+            // configuration.
+            return 0;
+        }
+    }
+
+    int max_active_blocks = -1;
+    if constexpr (enable_cutlass_3x)
+    {
+        tensorrt_llm::common::check_cuda_error(
+            cudaOccupancyMaxActiveBlocksPerMultiprocessor(&max_active_blocks, cutlass::device_kernel<GemmKernel>,
+                128 * (GemmKernel::NumLoadWarpGroups + GemmKernel::NumMmaWarpGroups), smem_size));
+    }
+    else
+    {
+        tensorrt_llm::common::check_cuda_error(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &max_active_blocks, cutlass::Kernel2<GemmKernel>, GemmKernel::kThreadCount, smem_size));
+    }
+
+    return max_active_blocks;
+}
+
 } // namespace cutlass_extensions
 } // namespace tensorrt_llm

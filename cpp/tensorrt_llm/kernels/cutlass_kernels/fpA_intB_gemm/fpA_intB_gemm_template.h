@@ -19,13 +19,17 @@
 #pragma GCC diagnostic ignored "-Wstrict-aliasing"
 #endif // #ifndef _WIN32
 
+#include "cutlass/complex.h"
+#include "cutlass/gemm/device/gemm_universal.h"
 #include "cutlass/gemm/kernel/default_gemm.h"
+#include "cutlass/gemm/kernel/default_gemm_universal.h"
 #include "cutlass_extensions/compute_occupancy.h"
 #include "cutlass_extensions/gemm/device/gemm_universal_base_compat.h"
 
 #include "cutlass_extensions/epilogue_helpers.h"
 #include "cutlass_extensions/gemm/kernel/default_fpA_intB_traits.h"
 #include "cutlass_extensions/gemm/kernel/fpA_intB_gemm.h"
+#include "cutlass_extensions/gemm/kernel/fpA_intB_gemm_streamk.h"
 #include "cutlass_extensions/gemm/threadblock/default_mma.h"
 #include "cutlass_extensions/gemm_configs.h"
 
@@ -101,26 +105,78 @@ void generic_mixed_gemm_kernelLauncher(ActivationType const* A, WeightType const
     using Operator = typename MixedGemmArchTraits::Operator;
     using TaggedOperator = typename cutlass::arch::TagOperator<Operator, QuantOp>::TaggedOperator;
 
-    using GemmKernel_ = typename cutlass::gemm::kernel::DefaultGemm<CutlassActivationType, cutlass::layout::RowMajor,
-        MixedGemmArchTraits::ElementsPerAccessA, CutlassWeightType, typename MixedGemmArchTraits::LayoutB,
-        MixedGemmArchTraits::ElementsPerAccessB, CutlassOutputType, cutlass::layout::RowMajor, ElementAccumulator,
-        cutlass::arch::OpClassTensorOp, arch, ThreadblockShape, WarpShape,
-        typename MixedGemmArchTraits::InstructionShape, EpilogueOp,
-        typename cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>, Stages, true,
+    // TODO: Consider all the different kernel types that can be instantiated here.
+
+    // using GemmKernel_ =  typename cutlass::platform::conditional<
+    //     gemm_config.split_k_style == tkc::SplitKStyle::SPLIT_K_SERIAL,
+    //     typename cutlass::gemm::kernel::DefaultGemm<
+    //         CutlassActivationType, cutlass::layout::RowMajor,
+    //         MixedGemmArchTraits::ElementsPerAccessA, CutlassWeightType,
+    //         typename MixedGemmArchTraits::LayoutB,
+    //         MixedGemmArchTraits::ElementsPerAccessB, CutlassOutputType,
+    //         cutlass::layout::RowMajor, ElementAccumulator,
+    //         cutlass::arch::OpClassTensorOp, arch, ThreadblockShape, WarpShape,
+    //         typename MixedGemmArchTraits::InstructionShape, EpilogueOp,
+    //         typename cutlass::gemm::threadblock::
+    //             GemmIdentityThreadblockSwizzle<>,
+    //         Stages, true, TaggedOperator>::GemmKernel,
+    //     typename cutlass::gemm::kernel::DefaultGemmUniversal<
+    //         CutlassActivationType, cutlass::layout::RowMajor,
+    //         cutlass::ComplexTransform::kNone,
+    //         MixedGemmArchTraits::ElementsPerAccessA, CutlassWeightType,
+    //         typename MixedGemmArchTraits::LayoutB,
+    //         cutlass::ComplexTransform::kNone,
+    //         MixedGemmArchTraits::ElementsPerAccessB, CutlassOutputType,
+    //         cutlass::layout::RowMajor, ElementAccumulator,
+    //         cutlass::arch::OpClassTensorOp, arch, ThreadblockShape, WarpShape,
+    //         typename MixedGemmArchTraits::InstructionShape, EpilogueOp,
+    //         typename cutlass::gemm::threadblock::ThreadblockSwizzleStreamK,
+    //         Stages, TaggedOperator>::GemmKernel
+    // >::type;
+
+    // using GemmKernel = typename std::conditional<
+    //     gemm_config.split_k_style == tkc::SplitKStyle::SPLIT_K_SERIAL,
+    //     cutlass::gemm::kernel::GemmFpAIntB<
+    //         typename GemmKernel_::Mma, typename GemmKernel_::Epilogue,
+    //         typename GemmKernel_::ThreadblockSwizzle,
+    //         arch,  // Ensure top level arch is used for dispatch
+    //         GemmKernel_::kSplitKSerial>,
+    //     cutlass::gemm::kernel::GemmFpAIntBStreamK<
+    //         typename GemmKernel_::Mma, typename GemmKernel_::Epilogue,
+    //         typename GemmKernel_::ThreadblockSwizzle, arch>
+    // >::type;
+
+    // using Gemm = typename std::conditional<
+    //     gemm_config.split_k_style == tkc::SplitKStyle::SPLIT_K_SERIAL,
+    //     cutlass::gemm::device::GemmUniversalBaseCompat<GemmKernel>,
+    //     cutlass::gemm::device::GemmUniversalBase<GemmKernel>
+    // >::type;
+
+    using GemmKernel_ = typename cutlass::gemm::kernel::DefaultGemmUniversal<
+        CutlassActivationType, cutlass::layout::RowMajor,
+        cutlass::ComplexTransform::kNone,
+        MixedGemmArchTraits::ElementsPerAccessA, CutlassWeightType,
+        typename MixedGemmArchTraits::LayoutB,
+        cutlass::ComplexTransform::kNone,
+        MixedGemmArchTraits::ElementsPerAccessB, CutlassOutputType,
+        cutlass::layout::RowMajor, ElementAccumulator,
+        cutlass::arch::OpClassTensorOp, arch, ThreadblockShape,
+        WarpShape, typename MixedGemmArchTraits::InstructionShape,
+        EpilogueOp, typename
+        cutlass::gemm::threadblock::ThreadblockSwizzleStreamK, Stages,
         TaggedOperator>::GemmKernel;
 
-    using GemmKernel = cutlass::gemm::kernel::GemmFpAIntB<typename GemmKernel_::Mma, typename GemmKernel_::Epilogue,
-        typename GemmKernel_::ThreadblockSwizzle,
-        arch, // Ensure top level arch is used for dispatch
-        GemmKernel_::kSplitKSerial>;
+    using GemmKernel = cutlass::gemm::kernel::GemmFpAIntBStreamK<
+        typename GemmKernel_::Mma, typename GemmKernel_::Epilogue,
+        typename GemmKernel_::ThreadblockSwizzle, arch>;
+    
+    using Gemm = cutlass::gemm::device::GemmUniversalBase<GemmKernel>;
 
     if (occupancy != nullptr)
     {
-        *occupancy = tensorrt_llm::cutlass_extensions::compute_occupancy_for_kernel<GemmKernel>();
+        *occupancy = tensorrt_llm::cutlass_extensions::compute_occupancy_for_kernel2<GemmKernel>();
         return;
     }
-
-    using Gemm = cutlass::gemm::device::GemmUniversalBaseCompat<GemmKernel>;
 
     int const ldb = cutlass::platform::is_same<cutlass::layout::RowMajor, typename MixedGemmArchTraits::LayoutB>::value
         ? n
@@ -196,13 +252,13 @@ void generic_mixed_gemm_kernelLauncher(ActivationType const* A, WeightType const
     }
 
     Gemm gemm;
-    if (gemm.get_workspace_size(args) > workspace_bytes)
-    {
-        TLLM_LOG_WARNING(
-            "Requested split-k but workspace size insufficient. Falling back to non-split-k implementation.");
-        // If requested split-k factor will require more workspace bytes, revert to standard gemm.
-        args.batch_count = 1;
-    }
+    // if (gemm.get_workspace_size(args) > workspace_bytes)
+    // {
+    //     TLLM_LOG_WARNING(
+    //         "Requested split-k but workspace size insufficient. Falling back to non-split-k implementation.");
+    //     // If requested split-k factor will require more workspace bytes, revert to standard gemm.
+    //     args.batch_count = 1;
+    // }
 
     auto can_implement = gemm.can_implement(args);
     if (can_implement != cutlass::Status::kSuccess)
