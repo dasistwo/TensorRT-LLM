@@ -252,13 +252,14 @@ void generic_mixed_gemm_kernelLauncher(ActivationType const* A, WeightType const
     }
 
     Gemm gemm;
-    // if (gemm.get_workspace_size(args) > workspace_bytes)
-    // {
-    //     TLLM_LOG_WARNING(
-    //         "Requested split-k but workspace size insufficient. Falling back to non-split-k implementation.");
-    //     // If requested split-k factor will require more workspace bytes, revert to standard gemm.
-    //     args.batch_count = 1;
-    // }
+    if (gemm.get_workspace_size(args) > workspace_bytes)
+    {
+        TLLM_LOG_WARNING(
+            "Requested split-k but workspace size insufficient. Falling back to non-split-k implementation.");
+        // If requested split-k factor will require more workspace bytes, revert to standard gemm.
+        // TODO: batch_count = 1 uses StreamK. Handle the error properly.
+        args.batch_count = 1;
+    }
 
     auto can_implement = gemm.can_implement(args);
     if (can_implement != cutlass::Status::kSuccess)
@@ -627,7 +628,8 @@ CutlassFpAIntBGemmRunner<ActivationType, WeightType, QuantOp, ScaleZeroType, Bia
     int const max_grid_m = cutlass::ceil_div(m, MIN_M_TILE);
     int const max_grid_n = cutlass::ceil_div(n, MIN_N_TILE);
     // We need 4 bytes per block in the worst case. We launch split_k_limit in z dim.
-    return static_cast<size_t>(max_grid_m * max_grid_n * SPLIT_K_LIMIT * 4);
+    return static_cast<size_t>(max_grid_m * max_grid_n * MAX_ACCUM_WORKSPACE * sizeof(float) + 
+                               max_grid_m * max_grid_n * MAX_K_ITERATION * sizeof(typename cutlass::Barrier::T));
 }
 
 } // namespace cutlass_kernels

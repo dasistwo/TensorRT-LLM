@@ -86,6 +86,12 @@ protected:
     static constexpr int SPLIT_K_LIMIT = 7;
     static constexpr int MIN_M_TILE = 16;
     static constexpr int MIN_N_TILE = 64;
+    // WarpShape::kM / 8
+    // max value 16 comes from WarpShape is 128x32x64
+    static constexpr int MAX_K_ITERATION = 16;
+    // WarpCount * OperatorCount * OperatorShape::kM * 16
+    // max value comes from CtaShape256x128x64_WarpShape64x64x64
+    static constexpr int MAX_ACCUM_WORKSPACE = SPLIT_K_LIMIT * 8 * 128 * 256;
 };
 
 template <typename ActivationType, typename WeightType, cutlass::WeightOnlyQuantOp QuantOp,
