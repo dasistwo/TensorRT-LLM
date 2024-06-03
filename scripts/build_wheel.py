@@ -66,7 +66,7 @@ def main(build_type: str = "Release",
     on_windows = platform.system() == "Windows"
     requirements_filename = "requirements-dev-windows.txt" if on_windows else "requirements-dev.txt"
     build_run(
-        f"\"{sys.executable}\" -m pip install -r {requirements_filename} --extra-index-url https://pypi.ngc.nvidia.com"
+        f"\"{sys.executable}\" -m pip install -q -r {requirements_filename} --extra-index-url https://pypi.ngc.nvidia.com"
     )
     # Ensure TRT is installed on windows to prevent surprises.
     reqs = check_output([sys.executable, "-m", "pip", "freeze"])
@@ -235,7 +235,7 @@ def main(build_type: str = "Release",
         copy(get_pybind_lib(), pkg_dir)
 
         with working_directory(project_dir):
-            build_run(f"\"{sys.executable}\" -m pip install pybind11-stubgen")
+            build_run(f"\"{sys.executable}\" -m pip install -q pybind11-stubgen")
         with working_directory(pkg_dir):
             if on_windows:
                 stubgen = "stubgen.py"
@@ -287,7 +287,7 @@ def main(build_type: str = "Release",
         )
 
     if install:
-        build_run(f"\"{sys.executable}\" -m pip install -e .[devel]")
+        build_run(f"\"{sys.executable}\" -m pip install -q -e .[devel]")
 
 
 if __name__ == "__main__":
