@@ -320,6 +320,15 @@ set(CMAKE_CXX_FLAGS
     "${CMAKE_CXX_FLAGS} -DBUILD_SYSTEM=cmake_oss -DENABLE_MULTI_DEVICE=${ENABLE_MULTI_DEVICE}"
 )
 
+# Add the option with CMAKE_CUDA_FLAGS causes error. Add G and Lineinfo.
+if(${CMAKE_BUILD_TYPE} MATCHES "Debug")
+  add_compile_options("$<$<COMPILE_LANGUAGE:CUDA>:-G>"
+                      "$<$<COMPILE_LANGUAGE:CUDA>:--host-linker-script>")
+elseif(${CMAKE_BUILD_TYPE} MATCHES "RelWithDebInfo")
+  add_compile_options("$<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>"
+                      "$<$<COMPILE_LANGUAGE:CUDA>:--host-linker-script>")
+endif()
+
 # Fix linking issue with TRT 10, the detailed description about `--mcmodel` can
 # be found in
 # https://gcc.gnu.org/onlinedocs/gcc/x86-Options.html#index-mcmodel_003dmedium-1
@@ -379,6 +388,10 @@ endif()
 
 set(COMMON_HEADER_DIRS ${PROJECT_SOURCE_DIR} ${CUDAToolkit_INCLUDE_DIR})
 message(STATUS "COMMON_HEADER_DIRS: ${COMMON_HEADER_DIRS}")
+
+# Let torch find the cudnn and cusparselt libraries
+set(CAFFE2_USE_CUDNN ON)
+set(CAFFE2_USE_CUSPARSELT ON)
 
 if(NOT WIN32 AND NOT DEFINED USE_CXX11_ABI)
   find_package(Python3 COMPONENTS Interpreter Development REQUIRED)
