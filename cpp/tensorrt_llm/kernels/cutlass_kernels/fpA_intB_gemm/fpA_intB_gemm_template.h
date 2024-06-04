@@ -56,34 +56,13 @@ namespace cutlass_kernels
 {
 
 template <typename ActivationType, typename WeightType, typename ScaleZeroType, typename BiasType, typename OutputType,
-    typename arch, cutlass::WeightOnlyQuantOp QuantOp, typename EpilogueTag, typename ThreadblockShape,
-    typename WarpShape, int Stages>
+    typename arch, cutlass::WeightOnlyQuantOp QuantOp, typename MixedGemmArchTraits, typename GemmKernel, typename Gemm>
 void generic_mixed_gemm_kernelLauncher(ActivationType const* A, WeightType const* B, ScaleZeroType const* weight_scales,
     ScaleZeroType const* weight_zero_points, BiasType const* biases, float const alpha, OutputType* C, int m, int n,
     int k, int const group_size, tkc::CutlassGemmConfig gemm_config, char* workspace, size_t workspace_bytes,
     cudaStream_t stream, int* occupancy = nullptr)
 {
     TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
-
-#ifdef ENABLE_BF16
-    static_assert(
-#ifdef ENABLE_FP8
-        cutlass::platform::is_same<ActivationType, __nv_fp8_e4m3>::value ||
-#endif
-            cutlass::platform::is_same<ActivationType, __nv_bfloat16>::value
-            || cutlass::platform::is_same<ActivationType, half>::value
-            || cutlass::platform::is_same<ActivationType, float>::value,
-        "Specialized for bfloat16, half, float");
-#else
-    static_assert(cutlass::platform::is_same<ActivationType, half>::value
-            || cutlass::platform::is_same<ActivationType, float>::value,
-        "Specialized for half, float");
-#endif
-
-    static_assert(cutlass::platform::is_same<ActivationType, WeightType>::value
-            || cutlass::platform::is_same<WeightType, uint8_t>::value
-            || cutlass::platform::is_same<WeightType, cutlass::uint4b_t>::value,
-        "");
 
     // The cutlass type for the input elements. This is needed to convert to cutlass::half_t if necessary.
     using CutlassActivationType = typename TllmToCutlassTypeAdapter<ActivationType>::type;
@@ -92,91 +71,7 @@ void generic_mixed_gemm_kernelLauncher(ActivationType const* A, WeightType const
     using CutlassBiasType = typename TllmToCutlassTypeAdapter<BiasType>::type;
     using CutlassOutputType = typename TllmToCutlassTypeAdapter<OutputType>::type;
 
-    // We need separate config for each architecture since we will target different tensorcore instructions. For float,
-    // we do not target TCs.
-    using MixedGemmArchTraits
-        = cutlass::gemm::kernel::MixedGemmArchTraits<CutlassActivationType, CutlassWeightType, arch>;
     using ElementAccumulator = typename MixedGemmArchTraits::AccType;
-
-    constexpr int ElementsPerAccessC = 128 / cutlass::sizeof_bits<CutlassOutputType>::value;
-    using EpilogueOp =
-        typename tkc::Epilogue<CutlassOutputType, ElementsPerAccessC, ElementAccumulator, EpilogueTag>::Op;
-
-    using Operator = typename MixedGemmArchTraits::Operator;
-    using TaggedOperator = typename cutlass::arch::TagOperator<Operator, QuantOp>::TaggedOperator;
-
-    // TODO: Consider all the different kernel types that can be instantiated here.
-
-    // using GemmKernel_ =  typename cutlass::platform::conditional<
-    //     gemm_config.split_k_style == tkc::SplitKStyle::SPLIT_K_SERIAL,
-    //     typename cutlass::gemm::kernel::DefaultGemm<
-    //         CutlassActivationType, cutlass::layout::RowMajor,
-    //         MixedGemmArchTraits::ElementsPerAccessA, CutlassWeightType,
-    //         typename MixedGemmArchTraits::LayoutB,
-    //         MixedGemmArchTraits::ElementsPerAccessB, CutlassOutputType,
-    //         cutlass::layout::RowMajor, ElementAccumulator,
-    //         cutlass::arch::OpClassTensorOp, arch, ThreadblockShape, WarpShape,
-    //         typename MixedGemmArchTraits::InstructionShape, EpilogueOp,
-    //         typename cutlass::gemm::threadblock::
-    //             GemmIdentityThreadblockSwizzle<>,
-    //         Stages, true, TaggedOperator>::GemmKernel,
-    //     typename cutlass::gemm::kernel::DefaultGemmUniversal<
-    //         CutlassActivationType, cutlass::layout::RowMajor,
-    //         cutlass::ComplexTransform::kNone,
-    //         MixedGemmArchTraits::ElementsPerAccessA, CutlassWeightType,
-    //         typename MixedGemmArchTraits::LayoutB,
-    //         cutlass::ComplexTransform::kNone,
-    //         MixedGemmArchTraits::ElementsPerAccessB, CutlassOutputType,
-    //         cutlass::layout::RowMajor, ElementAccumulator,
-    //         cutlass::arch::OpClassTensorOp, arch, ThreadblockShape, WarpShape,
-    //         typename MixedGemmArchTraits::InstructionShape, EpilogueOp,
-    //         typename cutlass::gemm::threadblock::ThreadblockSwizzleStreamK,
-    //         Stages, TaggedOperator>::GemmKernel
-    // >::type;
-
-    // using GemmKernel = typename std::conditional<
-    //     gemm_config.split_k_style == tkc::SplitKStyle::SPLIT_K_SERIAL,
-    //     cutlass::gemm::kernel::GemmFpAIntB<
-    //         typename GemmKernel_::Mma, typename GemmKernel_::Epilogue,
-    //         typename GemmKernel_::ThreadblockSwizzle,
-    //         arch,  // Ensure top level arch is used for dispatch
-    //         GemmKernel_::kSplitKSerial>,
-    //     cutlass::gemm::kernel::GemmFpAIntBStreamK<
-    //         typename GemmKernel_::Mma, typename GemmKernel_::Epilogue,
-    //         typename GemmKernel_::ThreadblockSwizzle, arch>
-    // >::type;
-
-    // using Gemm = typename std::conditional<
-    //     gemm_config.split_k_style == tkc::SplitKStyle::SPLIT_K_SERIAL,
-    //     cutlass::gemm::device::GemmUniversalBaseCompat<GemmKernel>,
-    //     cutlass::gemm::device::GemmUniversalBase<GemmKernel>
-    // >::type;
-
-    using GemmKernel_ = typename cutlass::gemm::kernel::DefaultGemmUniversal<
-        CutlassActivationType, cutlass::layout::RowMajor,
-        cutlass::ComplexTransform::kNone,
-        MixedGemmArchTraits::ElementsPerAccessA, CutlassWeightType,
-        typename MixedGemmArchTraits::LayoutB,
-        cutlass::ComplexTransform::kNone,
-        MixedGemmArchTraits::ElementsPerAccessB, CutlassOutputType,
-        cutlass::layout::RowMajor, ElementAccumulator,
-        cutlass::arch::OpClassTensorOp, arch, ThreadblockShape,
-        WarpShape, typename MixedGemmArchTraits::InstructionShape,
-        EpilogueOp, typename
-        cutlass::gemm::threadblock::ThreadblockSwizzleStreamK, Stages,
-        TaggedOperator>::GemmKernel;
-
-    using GemmKernel = cutlass::gemm::kernel::GemmFpAIntBStreamK<
-        typename GemmKernel_::Mma, typename GemmKernel_::Epilogue,
-        typename GemmKernel_::ThreadblockSwizzle, arch>;
-    
-    using Gemm = cutlass::gemm::device::GemmUniversalBase<GemmKernel>;
-
-    if (occupancy != nullptr)
-    {
-        *occupancy = tensorrt_llm::cutlass_extensions::compute_occupancy_for_kernel2<GemmKernel>();
-        return;
-    }
 
     int const ldb = cutlass::platform::is_same<cutlass::layout::RowMajor, typename MixedGemmArchTraits::LayoutB>::value
         ? n
@@ -255,10 +150,9 @@ void generic_mixed_gemm_kernelLauncher(ActivationType const* A, WeightType const
     if (gemm.get_workspace_size(args) > workspace_bytes)
     {
         TLLM_LOG_WARNING(
-            "Requested split-k but workspace size insufficient. Falling back to non-split-k implementation.");
+            "Requested split-k but workspace size insufficient. Inquiring additional workspace.");
         // If requested split-k factor will require more workspace bytes, revert to standard gemm.
-        // TODO: batch_count = 1 uses StreamK. Handle the error properly.
-        args.batch_count = 1;
+        workspace_bytes = gemm.get_workspace_size(args);
     }
 
     auto can_implement = gemm.can_implement(args);
@@ -285,6 +179,118 @@ void generic_mixed_gemm_kernelLauncher(ActivationType const* A, WeightType const
         throw std::runtime_error("[TensorRT-LLm Error][fpA_intB Runner] " + err_msg);
     }
 }
+
+// This selects GemmKernel and Gemm based on the SplitK config.
+template <typename ActivationType, typename WeightType, typename ScaleZeroType, typename BiasType, typename OutputType,
+    typename arch, cutlass::WeightOnlyQuantOp QuantOp, typename EpilogueTag, typename ThreadblockShape,
+    typename WarpShape, int Stages>
+void streamK_kernelSelector(ActivationType const* A, WeightType const* B, ScaleZeroType const* weight_scales,
+    ScaleZeroType const* weight_zero_points, BiasType const* biases, float const alpha, OutputType* C, int m, int n,
+    int k, int const group_size, tkc::CutlassGemmConfig gemm_config, char* workspace, size_t workspace_bytes,
+    cudaStream_t stream, int* occupancy = nullptr)
+{
+    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
+
+#ifdef ENABLE_BF16
+    static_assert(
+#ifdef ENABLE_FP8
+        cutlass::platform::is_same<ActivationType, __nv_fp8_e4m3>::value ||
+#endif
+            cutlass::platform::is_same<ActivationType, __nv_bfloat16>::value
+            || cutlass::platform::is_same<ActivationType, half>::value
+            || cutlass::platform::is_same<ActivationType, float>::value,
+        "Specialized for bfloat16, half, float");
+#else
+    static_assert(cutlass::platform::is_same<ActivationType, half>::value
+            || cutlass::platform::is_same<ActivationType, float>::value,
+        "Specialized for half, float");
+#endif
+
+    static_assert(cutlass::platform::is_same<ActivationType, WeightType>::value
+            || cutlass::platform::is_same<WeightType, uint8_t>::value
+            || cutlass::platform::is_same<WeightType, cutlass::uint4b_t>::value,
+        "");
+
+    // The cutlass type for the input elements. This is needed to convert to cutlass::half_t if necessary.
+    using CutlassActivationType = typename TllmToCutlassTypeAdapter<ActivationType>::type;
+    using CutlassWeightType = typename TllmToCutlassTypeAdapter<WeightType>::type;
+    using CutlassScaleZeroType = typename TllmToCutlassTypeAdapter<ScaleZeroType>::type;
+    using CutlassBiasType = typename TllmToCutlassTypeAdapter<BiasType>::type;
+    using CutlassOutputType = typename TllmToCutlassTypeAdapter<OutputType>::type;
+    
+    // We need separate config for each architecture since we will target different tensorcore instructions. For float,
+    // we do not target TCs.
+    using MixedGemmArchTraits
+        = cutlass::gemm::kernel::MixedGemmArchTraits<CutlassActivationType, CutlassWeightType, arch>;
+
+    constexpr int ElementsPerAccessC = 128 / cutlass::sizeof_bits<CutlassOutputType>::value;
+    using EpilogueOp =
+        typename tkc::Epilogue<CutlassOutputType, ElementsPerAccessC, typename MixedGemmArchTraits::AccType, EpilogueTag>::Op;
+
+    using TaggedOperator = typename cutlass::arch::TagOperator<typename MixedGemmArchTraits::Operator, QuantOp>::TaggedOperator;
+
+    // If SplitK is enabled, it launches the kernel with the split-k implementation.
+    // StreamK is only supported for SplitK = 1.
+    if (!gemm_config.is_streamk)
+    {
+        using GemmKernel_ =  typename cutlass::gemm::kernel::DefaultGemm<
+            CutlassActivationType, cutlass::layout::RowMajor, MixedGemmArchTraits::ElementsPerAccessA,
+            CutlassWeightType, typename MixedGemmArchTraits::LayoutB, MixedGemmArchTraits::ElementsPerAccessB,
+            CutlassOutputType, cutlass::layout::RowMajor, typename MixedGemmArchTraits::AccType,
+            cutlass::arch::OpClassTensorOp, arch, ThreadblockShape, WarpShape,
+            typename MixedGemmArchTraits::InstructionShape, EpilogueOp,
+            typename cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>,
+            Stages, true, TaggedOperator>::GemmKernel;
+
+        using GemmKernel = cutlass::gemm::kernel::GemmFpAIntB<
+            typename GemmKernel_::Mma, typename GemmKernel_::Epilogue, typename GemmKernel_::ThreadblockSwizzle,
+            arch,  // Ensure top level arch is used for dispatch
+            GemmKernel_::kSplitKSerial>;
+
+        using Gemm = cutlass::gemm::device::GemmUniversalBaseCompat<GemmKernel>;
+
+        if (occupancy != nullptr)
+        {
+            *occupancy = tensorrt_llm::cutlass_extensions::compute_occupancy_for_kernel<GemmKernel>();
+            return;
+        }
+
+        generic_mixed_gemm_kernelLauncher<ActivationType, WeightType, ScaleZeroType, BiasType, OutputType, arch, QuantOp,
+            MixedGemmArchTraits, GemmKernel, Gemm>(A, B, weight_scales, weight_zero_points, biases, alpha, C, m,
+            n, k, group_size, gemm_config, workspace, workspace_bytes, stream, occupancy);
+    }
+    else
+    {
+        using GemmKernel_ = typename cutlass::gemm::kernel::DefaultGemmUniversal<
+            CutlassActivationType, cutlass::layout::RowMajor,
+            cutlass::ComplexTransform::kNone, MixedGemmArchTraits::ElementsPerAccessA,
+            CutlassWeightType, typename MixedGemmArchTraits::LayoutB,
+            cutlass::ComplexTransform::kNone, MixedGemmArchTraits::ElementsPerAccessB,
+            CutlassOutputType, cutlass::layout::RowMajor, typename MixedGemmArchTraits::AccType,
+            cutlass::arch::OpClassTensorOp, arch, ThreadblockShape, WarpShape,
+            typename MixedGemmArchTraits::InstructionShape, EpilogueOp,
+            typename cutlass::gemm::threadblock::ThreadblockSwizzleStreamK,
+            Stages, TaggedOperator>::GemmKernel;
+
+        using GemmKernel = cutlass::gemm::kernel::GemmFpAIntBStreamK<
+            typename GemmKernel_::Mma, typename GemmKernel_::Epilogue,
+            typename GemmKernel_::ThreadblockSwizzle, arch>;
+
+        using Gemm = cutlass::gemm::device::GemmUniversalBase<GemmKernel>;
+
+        if (occupancy != nullptr)
+        {
+            *occupancy = tensorrt_llm::cutlass_extensions::compute_occupancy_for_kernel2<GemmKernel>();
+            return;
+        }
+
+        generic_mixed_gemm_kernelLauncher<ActivationType, WeightType, ScaleZeroType, BiasType, OutputType, arch, QuantOp,
+            MixedGemmArchTraits, GemmKernel, Gemm>(A, B, weight_scales, weight_zero_points, biases, alpha, C, m,
+            n, k, group_size, gemm_config, workspace, workspace_bytes, stream, occupancy);
+    }
+}
+
+
 
 // This filters out invalid template combinations that we DON'T want instantiated in CUTLASS. For example,
 // instantiating SM=75, Stages=3 is invalid so we would need to filter that out. Fine grained
@@ -323,7 +329,7 @@ void filter_and_run_mixed_gemm(ActivationType const* A, WeightType const* B, Sca
     }
     else
     {
-        generic_mixed_gemm_kernelLauncher<ActivationType, WeightType, ScaleZeroType, BiasType, OutputType, arch,
+        streamK_kernelSelector<ActivationType, WeightType, ScaleZeroType, BiasType, OutputType, arch,
             QuantOp, EpilogueTag, ThreadblockShape, WarpShape, Stages>(A, B, weight_scales, weight_zero_points, biases,
             alpha, C, m, n, k, group_size, gemm_config, workspace, workspace_bytes, stream, occupancy);
     }
@@ -628,8 +634,8 @@ CutlassFpAIntBGemmRunner<ActivationType, WeightType, QuantOp, ScaleZeroType, Bia
     int const max_grid_m = cutlass::ceil_div(m, MIN_M_TILE);
     int const max_grid_n = cutlass::ceil_div(n, MIN_N_TILE);
     // We need 4 bytes per block in the worst case. We launch split_k_limit in z dim.
-    return static_cast<size_t>(max_grid_m * max_grid_n * MAX_ACCUM_WORKSPACE * sizeof(float) + 
-                               max_grid_m * max_grid_n * MAX_K_ITERATION * sizeof(typename cutlass::Barrier::T));
+    return static_cast<size_t>(max_grid_m * max_grid_n * SPLIT_K_LIMIT * 4);
+    
 }
 
 } // namespace cutlass_kernels

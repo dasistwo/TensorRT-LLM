@@ -258,14 +258,18 @@ std::vector<CutlassGemmConfig> get_candidate_configs(
     {
         for (int stages = min_stages; stages <= max_stages; ++stages)
         {
-            CutlassGemmConfig config(tile_config, SplitKStyle::NO_SPLIT_K, 1, stages);
-            candidate_configs.push_back(config);
+            CutlassGemmConfig config_f(tile_config, SplitKStyle::NO_SPLIT_K, 1, stages, false);
+            CutlassGemmConfig config_t(tile_config, SplitKStyle::NO_SPLIT_K, 1, stages, true);
+            candidate_configs.push_back(config_f);
+            candidate_configs.push_back(config_t);
             if (sm >= 75)
             {
                 for (int split_k_factor = 2; split_k_factor <= max_split_k; ++split_k_factor)
                 {
-                    auto config = CutlassGemmConfig{tile_config, SplitKStyle::SPLIT_K_SERIAL, split_k_factor, stages};
-                    candidate_configs.push_back(config);
+                    auto config_f = CutlassGemmConfig{tile_config, SplitKStyle::SPLIT_K_SERIAL, split_k_factor, stages, false};
+                    auto config_t = CutlassGemmConfig{tile_config, SplitKStyle::SPLIT_K_SERIAL, split_k_factor, stages, true};
+                    candidate_configs.push_back(config_f);
+                    candidate_configs.push_back(config_t);
                 }
             }
         }
@@ -335,7 +339,7 @@ CutlassGemmConfig estimate_best_config_from_occupancies(std::vector<CutlassGemmC
                     SplitKStyle split_style
                         = split_k_factor > 1 ? SplitKStyle::SPLIT_K_SERIAL : SplitKStyle::NO_SPLIT_K;
                     best_config = CutlassGemmConfig(
-                        candidate_config.tile_config, split_style, split_k_factor, candidate_config.stages);
+                        candidate_config.tile_config, split_style, split_k_factor, candidate_config.stages, candidate_config.is_streamk);
                     current_m_tile = tile_shape.m;
                 }
                 else if (current_score == config_score
@@ -346,7 +350,7 @@ CutlassGemmConfig estimate_best_config_from_occupancies(std::vector<CutlassGemmC
                     SplitKStyle split_style
                         = split_k_factor > 1 ? SplitKStyle::SPLIT_K_SERIAL : SplitKStyle::NO_SPLIT_K;
                     best_config = CutlassGemmConfig(
-                        candidate_config.tile_config, split_style, split_k_factor, candidate_config.stages);
+                        candidate_config.tile_config, split_style, split_k_factor, candidate_config.stages, candidate_config.is_streamk);
                     current_m_tile = tile_shape.m;
                     config_waves = num_waves_total;
                 }

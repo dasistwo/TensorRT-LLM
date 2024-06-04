@@ -129,6 +129,7 @@ struct CutlassGemmConfig
     SplitKStyle split_k_style = SplitKStyle::NO_SPLIT_K;
     int split_k_factor = -1;
     int stages = -1;
+    bool is_streamk = false;
 
     // config options for sm90
     CutlassTileConfigSM90 tile_config_sm90 = CutlassTileConfigSM90::ChooseWithHeuristic;
@@ -139,11 +140,12 @@ struct CutlassGemmConfig
 
     CutlassGemmConfig() {}
 
-    CutlassGemmConfig(CutlassTileConfig tile_config, SplitKStyle split_k_style, int split_k_factor, int stages)
+    CutlassGemmConfig(CutlassTileConfig tile_config, SplitKStyle split_k_style, int split_k_factor, int stages, bool is_streamk)
         : tile_config(tile_config)
         , split_k_style(split_k_style)
         , split_k_factor(split_k_factor)
         , stages(stages)
+        , is_streamk(is_streamk)
         , is_sm90(false)
     {
     }
@@ -174,7 +176,7 @@ struct CutlassGemmConfig
             assert(!is_sm90 && "Invalid cutlass GEMM config");
             tactic << "\n\tstyle=compatible"
                    << "\n\ttile shape ID: " << (int) tile_config << "\n\tstages: " << (int) stages
-                   << "\n\tsplit k: " << (int) split_k_factor;
+                   << "\n\tsplit k: " << (int) split_k_factor << "\n\tusing streamk: " << is_streamk;
         }
         else
         {
