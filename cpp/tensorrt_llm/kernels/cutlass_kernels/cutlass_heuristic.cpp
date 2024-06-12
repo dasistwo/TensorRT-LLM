@@ -258,18 +258,16 @@ std::vector<CutlassGemmConfig> get_candidate_configs(
     {
         for (int stages = min_stages; stages <= max_stages; ++stages)
         {
-            CutlassGemmConfig config_f(tile_config, SplitKStyle::NO_SPLIT_K, 1, stages, false);
-            CutlassGemmConfig config_t(tile_config, SplitKStyle::NO_SPLIT_K, 1, stages, true);
-            candidate_configs.push_back(config_f);
-            candidate_configs.push_back(config_t);
+            CutlassGemmConfig config_split(tile_config, SplitKStyle::NO_SPLIT_K, 1, stages, false);
+            CutlassGemmConfig config_stream(tile_config, SplitKStyle::NO_SPLIT_K, 1, stages, true);
+            candidate_configs.push_back(config_split);
+            candidate_configs.push_back(config_stream);
             if (sm >= 75)
             {
                 for (int split_k_factor = 2; split_k_factor <= max_split_k; ++split_k_factor)
                 {
-                    auto config_f = CutlassGemmConfig{tile_config, SplitKStyle::SPLIT_K_SERIAL, split_k_factor, stages, false};
-                    auto config_t = CutlassGemmConfig{tile_config, SplitKStyle::SPLIT_K_SERIAL, split_k_factor, stages, true};
-                    candidate_configs.push_back(config_f);
-                    candidate_configs.push_back(config_t);
+                    auto config_split = CutlassGemmConfig{tile_config, SplitKStyle::SPLIT_K_SERIAL, split_k_factor, stages, false};
+                    candidate_configs.push_back(config_split);
                 }
             }
         }

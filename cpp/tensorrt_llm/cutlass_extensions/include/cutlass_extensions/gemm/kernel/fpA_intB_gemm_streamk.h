@@ -318,16 +318,6 @@ struct GemmFpAIntBStreamK
         /// Returns the workspace size (in bytes) needed for these parameters
         size_t get_workspace_size() const
         {
-            // std::cout << "get_workspace_size = " << get_barrier_workspace_size() \
-            //     << ", get_partials_workspace_size = " << get_partials_workspace_size() << std::endl;
-            // std::cout << "problem_size = " \
-            //           << block_mapping.problem_size.m() << ", " \
-            //           << block_mapping.problem_size.n() << ", " \
-            //           << block_mapping.problem_size.k() \
-            //           << std::endl;
-            // std::cout << "sk_regions = " << block_mapping.sk_regions() << std::endl;
-            // std::cout << "sk_blocks_per_region = " << block_mapping.sk_blocks_per_region() << std::endl;
-            // std::cout << "reduction_blocks = " << block_mapping.reduction_blocks << std::endl;
             return get_barrier_workspace_size() + get_partials_workspace_size();
         }
 

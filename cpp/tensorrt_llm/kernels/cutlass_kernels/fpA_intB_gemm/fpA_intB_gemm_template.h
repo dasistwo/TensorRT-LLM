@@ -150,9 +150,7 @@ void generic_mixed_gemm_kernelLauncher(ActivationType const* A, WeightType const
     if (gemm.get_workspace_size(args) > workspace_bytes)
     {
         TLLM_LOG_WARNING(
-            "Requested split-k but workspace size insufficient. Inquiring additional workspace.");
-        // If requested split-k factor will require more workspace bytes, revert to standard gemm.
-        workspace_bytes = gemm.get_workspace_size(args);
+            "Requested workspace size is insufficient.");
     }
 
     auto can_implement = gemm.can_implement(args);

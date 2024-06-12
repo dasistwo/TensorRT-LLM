@@ -105,7 +105,8 @@ def main(args):
     dataset = load_dataset(dataset_name,
                            dataset_revision,
                            cache_dir=args.dataset_cache_dir,
-                           split=dataset_split)
+                           split=dataset_split,
+                           trust_remote_code=True)
 
     max_batch_size = args.batch_size
 
@@ -409,7 +410,7 @@ def main(args):
         assert not (args.eval_ppl and not (runner.gather_context_logits and runner.gather_generation_logits)), \
             "PPL evaluation requires engine built with gather_all_token_logits enabled"
 
-        datapoint = dataset[0:1]
+        datapoint = dataset[0:max_batch_size]
         output, *_ = eval_trt_llm(datapoint,
                                   eval_task=args.eval_task,
                                   eval_ppl=args.eval_ppl,
