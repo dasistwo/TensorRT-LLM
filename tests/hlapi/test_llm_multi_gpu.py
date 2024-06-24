@@ -8,7 +8,7 @@ import torch
 from parameterized import parameterized
 
 from tensorrt_llm.hlapi.llm import (LLM, KvCacheConfig, ModelConfig,
-                                    SamplingConfig)
+                                    SamplingParams)
 from tensorrt_llm.hlapi.tokenizer import TransformersTokenizer
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
@@ -69,11 +69,9 @@ def test_llm_loading_from_ckpt_for_tp2(
     tokenizer = TransformersTokenizer.from_pretrained(llama_model_path)
     llm = LLM(config, tokenizer=tokenizer, enable_executor=enable_executor)
 
-    sampling_config = llm.get_default_sampling_config()
-    assert sampling_config is not None
-    sampling_config.max_new_tokens = 8
+    sampling_params = SamplingParams(max_new_tokens=8)
 
-    for output in llm.generate(prompts, sampling_config=sampling_config):
+    for output in llm.generate(prompts, sampling_params=sampling_params):
         print(output)
         assert output.text == "D E F G H I J K"
 
@@ -94,12 +92,17 @@ def test_llm_generate_tp2(engine_from_checkpoint):
         print(output)
 
 
-@skip_single_gpu
 @pytest.mark.parametrize("use_auto_parallel", [True, False],
                          ids=["enable_auto_parallel", "disable_auto_parallel"])
+@pytest.mark.parametrize("from_ckpt", [True, False],
+                         ids=["from_ckpt", "from_hf"])
+@skip_single_gpu
 def test_llm_generate_async_tp2(
-        use_auto_parallel, engine_from_checkpoint: tempfile.TemporaryDirectory):
-    model_dir = engine_from_checkpoint.name if not use_auto_parallel else get_model_path(
+        engine_from_checkpoint: tempfile.TemporaryDirectory,
+        use_auto_parallel: bool, from_ckpt: bool):
+    if use_auto_parallel and from_ckpt:
+        pytest.skip("Skip auto parallel for TP2 checkpoint")
+    model_dir = engine_from_checkpoint.name if from_ckpt else get_model_path(
         llama_model_path)
     tokenizer_dir = get_model_path(llama_model_path)
     tokenizer = TransformersTokenizer.from_pretrained(tokenizer_dir)
@@ -146,10 +149,8 @@ def test_llm_pp2():
         config,
         kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4),
     )
-    sampling_config = SamplingConfig()
-    sampling_config.max_new_tokens = 8
-    sampling_config.beam_width = 1
-    for output in llm.generate(prompts, sampling_config=sampling_config):
+    sampling_params = SamplingParams(max_new_tokens=8, beam_width=1)
+    for output in llm.generate(prompts, sampling_params=sampling_params):
         print(output)
         assert output.text == "D E F G H I J K"
 
@@ -193,9 +194,8 @@ def test_llm_end2end_tp2(llm_additional_options):
 
     assert len(llm_additional_options) == 0
 
-    sampling_config = llm.get_default_sampling_config()
-    sampling_config.max_new_tokens = 8
-    for output in llm.generate(prompts, sampling_config=sampling_config):
+    sampling_params = SamplingParams(max_new_tokens=8)
+    for output in llm.generate(prompts, sampling_params=sampling_params):
         print(output)
         assert output.text == "D E F G H I J K"
 

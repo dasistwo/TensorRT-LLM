@@ -32,7 +32,7 @@ class BuildConfig:
     max_batch_size: int
     max_input_len: Optional[int] = None
     num_kv_heads: Optional[int] = None
-    max_output_len: Optional[int] = None
+    max_seq_len: Optional[int] = None
     max_beam_width: int = 1
     # TRT builder_optimization_level from 0 to 5
     builder_opt: Optional[int] = None
@@ -89,10 +89,11 @@ class EncDecBuildConfig:
     normalize_before: Optional[bool] = None
     max_encoder_input_len: Optional[int] = None
     max_decoder_input_len: Optional[int] = None
-    max_output_len: Optional[int] = None
+    max_seq_len: Optional[int] = None
     builder_opt: Optional[int] = None
     n_mels: Optional[int] = None
     skip_cross_qkv: bool = False
+    use_implicit_relative_attention: Optional[bool] = False
 
     def __post_init__(self) -> None:
         assert self.head_size is not None
@@ -121,7 +122,7 @@ _allowed_configs = {
                     n_positions=1024,
                     max_batch_size=256,
                     max_input_len=512,
-                    max_output_len=200,
+                    max_seq_len=712,
                     builder_opt=None,
                 )),
     "gpt_1.5b":
@@ -137,7 +138,7 @@ _allowed_configs = {
                     n_positions=1024,
                     max_batch_size=256,
                     max_input_len=512,
-                    max_output_len=200,
+                    max_seq_len=712,
                     builder_opt=None,
                 )),
     "gpt_175b":
@@ -153,7 +154,7 @@ _allowed_configs = {
                     n_positions=2048,
                     max_batch_size=64,
                     max_input_len=512,
-                    max_output_len=200,
+                    max_seq_len=712,
                     builder_opt=None,
                 )),
     "gpt_350m_moe":
@@ -169,7 +170,7 @@ _allowed_configs = {
                     n_positions=1024,
                     max_batch_size=256,
                     max_input_len=512,
-                    max_output_len=200,
+                    max_seq_len=712,
                     builder_opt=None,
                     moe_num_experts=8,
                     moe_top_k=1,
@@ -187,7 +188,7 @@ _allowed_configs = {
                     n_positions=1024,
                     max_batch_size=256,
                     max_input_len=512,
-                    max_output_len=200,
+                    max_seq_len=712,
                     builder_opt=None,
                     quantization="int8_sq_per_tensor",
                 )),
@@ -204,7 +205,7 @@ _allowed_configs = {
                     n_positions=1024,
                     max_batch_size=256,
                     max_input_len=512,
-                    max_output_len=200,
+                    max_seq_len=712,
                     builder_opt=None,
                     quantization="int8_sq_per_token_channel",
                 )),
@@ -221,7 +222,7 @@ _allowed_configs = {
                     n_positions=1024,
                     max_batch_size=256,
                     max_input_len=512,
-                    max_output_len=200,
+                    max_seq_len=712,
                     builder_opt=None,
                     position_embedding_type='rope_gpt_neox',
                     rotary_pct=0.5,
@@ -240,7 +241,7 @@ _allowed_configs = {
                     n_positions=2048,
                     max_batch_size=256,
                     max_input_len=512,
-                    max_output_len=200,
+                    max_seq_len=712,
                     builder_opt=None,
                     pre_norm=False,
                     do_layer_norm_before=False,
@@ -258,7 +259,7 @@ _allowed_configs = {
                     n_positions=2048,
                     max_batch_size=256,
                     max_input_len=512,
-                    max_output_len=200,
+                    max_seq_len=712,
                     builder_opt=None,
                     pre_norm=False,
                     do_layer_norm_before=True,
@@ -276,7 +277,7 @@ _allowed_configs = {
                     n_positions=2048,
                     max_batch_size=256,
                     max_input_len=512,
-                    max_output_len=200,
+                    max_seq_len=712,
                     builder_opt=None,
                     pre_norm=False,
                     do_layer_norm_before=True,
@@ -294,7 +295,7 @@ _allowed_configs = {
                     n_positions=2048,
                     max_batch_size=256,
                     max_input_len=512,
-                    max_output_len=200,
+                    max_seq_len=712,
                     builder_opt=None,
                     pre_norm=False,
                     do_layer_norm_before=True,
@@ -312,7 +313,7 @@ _allowed_configs = {
                     n_positions=2048,
                     max_batch_size=64,
                     max_input_len=512,
-                    max_output_len=200,
+                    max_seq_len=712,
                     builder_opt=None,
                     pre_norm=True,
                     do_layer_norm_before=True,
@@ -331,7 +332,7 @@ _allowed_configs = {
                     n_positions=8192,
                     max_batch_size=256,
                     max_input_len=512,
-                    max_output_len=200,
+                    max_seq_len=712,
                     builder_opt=None,
                 )),
     "starcoder2_3b":
@@ -350,7 +351,7 @@ _allowed_configs = {
                     rotary_pct=1.0,
                     max_batch_size=256,
                     max_input_len=512,
-                    max_output_len=200,
+                    max_seq_len=712,
                     builder_opt=None,
                 )),
     "llama_7b":
@@ -367,7 +368,7 @@ _allowed_configs = {
                     inter_size=11008,
                     max_batch_size=128,
                     max_input_len=512,
-                    max_output_len=200,
+                    max_seq_len=712,
                     builder_opt=None,
                 )),
     "llama_13b":
@@ -384,7 +385,7 @@ _allowed_configs = {
                     inter_size=13824,
                     max_batch_size=128,
                     max_input_len=512,
-                    max_output_len=200,
+                    max_seq_len=712,
                     builder_opt=None,
                 )),
     "llama_30b":
@@ -401,7 +402,7 @@ _allowed_configs = {
                     inter_size=17920,
                     max_batch_size=64,
                     max_input_len=512,
-                    max_output_len=200,
+                    max_seq_len=712,
                     builder_opt=None,
                 )),
     "llama_70b":
@@ -419,7 +420,7 @@ _allowed_configs = {
                     inter_size=28672,
                     max_batch_size=64,
                     max_input_len=512,
-                    max_output_len=200,
+                    max_seq_len=712,
                     builder_opt=None,
                 )),
     "llama_70b_long_context":
@@ -436,7 +437,7 @@ _allowed_configs = {
                                          inter_size=28672,
                                          max_batch_size=16,
                                          max_input_len=8000,
-                                         max_output_len=200,
+                                         max_seq_len=8200,
                                          builder_opt=None,
                                          enable_multi_block_mode=True)),
     "llama_70b_long_generation":
@@ -453,7 +454,7 @@ _allowed_configs = {
                                          inter_size=28672,
                                          max_batch_size=64,
                                          max_input_len=200,
-                                         max_output_len=16384,
+                                         max_seq_len=16584,
                                          builder_opt=None,
                                          enable_multi_block_mode=True)),
     "llama_70b_sq_per_tensor":
@@ -470,7 +471,7 @@ _allowed_configs = {
                                          inter_size=28672,
                                          max_batch_size=128,
                                          max_input_len=512,
-                                         max_output_len=200,
+                                         max_seq_len=712,
                                          builder_opt=None,
                                          quantization="int8_sq_per_tensor")),
     "mixtral_8x7b":
@@ -488,7 +489,7 @@ _allowed_configs = {
                     inter_size=14336,
                     max_batch_size=128,
                     max_input_len=512,
-                    max_output_len=200,
+                    max_seq_len=712,
                     builder_opt=None,
                     moe_num_experts=8,
                     moe_top_k=2,
@@ -507,7 +508,7 @@ _allowed_configs = {
                     rotary_dim=64,
                     max_batch_size=128,
                     max_input_len=512,
-                    max_output_len=200,
+                    max_seq_len=712,
                     builder_opt=None,
                 )),
     "gptneox_20b":
@@ -524,7 +525,7 @@ _allowed_configs = {
                     rotary_dim=24,
                     max_batch_size=16,
                     max_input_len=512,
-                    max_output_len=512,
+                    max_seq_len=1024,
                     builder_opt=None,
                 )),
     "chatglm_6b":
@@ -542,7 +543,7 @@ _allowed_configs = {
                     n_positions=2048,
                     max_batch_size=256,
                     max_input_len=512,
-                    max_output_len=200,
+                    max_seq_len=712,
                     builder_opt=None,
                     remove_input_padding=False,
                 )),
@@ -561,7 +562,7 @@ _allowed_configs = {
                     n_positions=2048,
                     max_batch_size=256,
                     max_input_len=512,
-                    max_output_len=200,
+                    max_seq_len=712,
                     builder_opt=None,
                     remove_input_padding=False,
                 )),
@@ -580,7 +581,26 @@ _allowed_configs = {
                     n_positions=2048,
                     max_batch_size=256,
                     max_input_len=512,
-                    max_output_len=200,
+                    max_seq_len=712,
+                    builder_opt=None,
+                    remove_input_padding=False,
+                )),
+    "glm_10b":
+    ModelConfig(name="glm_10b",
+                family="glm",
+                benchmark_type="gpt",
+                build_config=BuildConfig(
+                    num_layers=48,
+                    num_heads=64,
+                    num_kv_heads=64,
+                    hidden_size=4096,
+                    inter_size=16384,
+                    vocab_size=50304,
+                    hidden_act='gelu',
+                    n_positions=1024,
+                    max_batch_size=128,
+                    max_input_len=1024,
+                    max_seq_len=1280,
                     builder_opt=None,
                     remove_input_padding=False,
                 )),
@@ -597,7 +617,7 @@ _allowed_configs = {
                     n_positions=2048,
                     max_batch_size=32,
                     max_input_len=1024,
-                    max_output_len=1024,
+                    max_seq_len=2048,
                     builder_opt=None,
                 )),
     "bloom_176b":
@@ -613,7 +633,7 @@ _allowed_configs = {
                     n_positions=2048,
                     max_batch_size=8,
                     max_input_len=1024,
-                    max_output_len=1024,
+                    max_seq_len=2048,
                     builder_opt=None,
                 )),
     "bert_base":
@@ -683,7 +703,7 @@ _allowed_configs = {
                     n_positions=2048,
                     max_batch_size=256,
                     max_input_len=1024,
-                    max_output_len=1024,
+                    max_seq_len=2048,
                     builder_opt=None,
                     bias=True,
                     use_alibi=True,
@@ -704,7 +724,7 @@ _allowed_configs = {
                     n_positions=2048,
                     max_batch_size=128,
                     max_input_len=512,
-                    max_output_len=200,
+                    max_seq_len=712,
                     builder_opt=None,
                     bias=False,
                     use_alibi=False,
@@ -725,7 +745,7 @@ _allowed_configs = {
                     n_positions=2048,
                     max_batch_size=64,
                     max_input_len=512,
-                    max_output_len=200,
+                    max_seq_len=712,
                     builder_opt=None,
                     bias=False,
                     use_alibi=False,
@@ -746,7 +766,7 @@ _allowed_configs = {
                     n_positions=2048,
                     max_batch_size=8,
                     max_input_len=1024,
-                    max_output_len=1024,
+                    max_seq_len=2048,
                     builder_opt=None,
                     bias=False,
                     use_alibi=False,
@@ -771,7 +791,7 @@ _allowed_configs = {
                     max_batch_size=8,
                     max_encoder_input_len=1024,
                     max_decoder_input_len=1,
-                    max_output_len=200,
+                    max_seq_len=201,
                     builder_opt=None,
                 )),
     "t5_base":
@@ -792,7 +812,7 @@ _allowed_configs = {
                     max_batch_size=8,
                     max_encoder_input_len=1024,
                     max_decoder_input_len=1,
-                    max_output_len=200,
+                    max_seq_len=201,
                     builder_opt=None,
                 )),
     "t5_large":
@@ -813,7 +833,7 @@ _allowed_configs = {
                     max_batch_size=8,
                     max_encoder_input_len=1024,
                     max_decoder_input_len=1,
-                    max_output_len=200,
+                    max_seq_len=201,
                     builder_opt=None,
                 )),
     "t5_3b":
@@ -834,7 +854,7 @@ _allowed_configs = {
                     max_batch_size=8,
                     max_encoder_input_len=1024,
                     max_decoder_input_len=1,
-                    max_output_len=200,
+                    max_seq_len=201,
                     builder_opt=None,
                 )),
     "t5_11b":
@@ -855,7 +875,7 @@ _allowed_configs = {
                     max_batch_size=8,
                     max_encoder_input_len=1024,
                     max_decoder_input_len=1,
-                    max_output_len=200,
+                    max_seq_len=201,
                     builder_opt=None,
                 )),
     "flan_t5_small":
@@ -877,7 +897,7 @@ _allowed_configs = {
                     max_batch_size=8,
                     max_encoder_input_len=1024,
                     max_decoder_input_len=1,
-                    max_output_len=200,
+                    max_seq_len=201,
                     builder_opt=None,
                 )),
     "flan_t5_base":
@@ -899,7 +919,7 @@ _allowed_configs = {
                     max_batch_size=8,
                     max_encoder_input_len=1024,
                     max_decoder_input_len=1,
-                    max_output_len=200,
+                    max_seq_len=201,
                     builder_opt=None,
                 )),
     "flan_t5_large":
@@ -921,7 +941,7 @@ _allowed_configs = {
                     max_batch_size=8,
                     max_encoder_input_len=1024,
                     max_decoder_input_len=1,
-                    max_output_len=200,
+                    max_seq_len=201,
                     builder_opt=None,
                 )),
     "flan_t5_xl":
@@ -943,7 +963,7 @@ _allowed_configs = {
                     max_batch_size=8,
                     max_encoder_input_len=1024,
                     max_decoder_input_len=1,
-                    max_output_len=200,
+                    max_seq_len=201,
                     builder_opt=None,
                 )),
     "flan_t5_xxl":
@@ -965,7 +985,7 @@ _allowed_configs = {
                     max_batch_size=8,
                     max_encoder_input_len=1024,
                     max_decoder_input_len=1,
-                    max_output_len=200,
+                    max_seq_len=201,
                     builder_opt=None,
                 )),
     "bart_large_cnn":
@@ -988,7 +1008,7 @@ _allowed_configs = {
                     max_batch_size=8,
                     max_encoder_input_len=1024,
                     max_decoder_input_len=1,
-                    max_output_len=200,
+                    max_seq_len=201,
                     builder_opt=None,
                 )),
     "mbart_large_50_many_to_one_mmt":
@@ -1010,7 +1030,7 @@ _allowed_configs = {
                     max_batch_size=8,
                     max_encoder_input_len=1024,
                     max_decoder_input_len=1,
-                    max_output_len=200,
+                    max_seq_len=201,
                     builder_opt=None,
                 )),
     "baichuan_7b":
@@ -1027,7 +1047,7 @@ _allowed_configs = {
                     inter_size=11008,
                     max_batch_size=128,
                     max_input_len=512,
-                    max_output_len=200,
+                    max_seq_len=712,
                     builder_opt=None,
                 )),
     "baichuan2_7b_chat":
@@ -1044,7 +1064,7 @@ _allowed_configs = {
                     inter_size=11008,
                     max_batch_size=128,
                     max_input_len=512,
-                    max_output_len=200,
+                    max_seq_len=712,
                     builder_opt=None,
                 )),
     "baichuan_13b_chat":
@@ -1061,7 +1081,7 @@ _allowed_configs = {
                     inter_size=13696,
                     max_batch_size=64,
                     max_input_len=512,
-                    max_output_len=200,
+                    max_seq_len=712,
                     builder_opt=None,
                 )),
     "baichuan2_13b_chat":
@@ -1078,7 +1098,7 @@ _allowed_configs = {
                     inter_size=13696,
                     max_batch_size=64,
                     max_input_len=512,
-                    max_output_len=200,
+                    max_seq_len=712,
                     builder_opt=None,
                 )),
     "internlm_chat_7b":
@@ -1096,7 +1116,7 @@ _allowed_configs = {
                     inter_size=11008,
                     max_batch_size=128,
                     max_input_len=512,
-                    max_output_len=200,
+                    max_seq_len=712,
                     builder_opt=None,
                     bias=True,
                 )),
@@ -1115,7 +1135,7 @@ _allowed_configs = {
                     inter_size=13824,
                     max_batch_size=64,
                     max_input_len=512,
-                    max_output_len=200,
+                    max_seq_len=712,
                     builder_opt=None,
                     bias=False,
                 )),
@@ -1132,7 +1152,7 @@ _allowed_configs = {
                                          inter_size=22016,
                                          max_batch_size=128,
                                          max_input_len=512,
-                                         max_output_len=200,
+                                         max_seq_len=712,
                                          builder_opt=None,
                                          bias=False)),
     "qwen_14b_chat":
@@ -1149,7 +1169,7 @@ _allowed_configs = {
                     inter_size=27392,
                     max_batch_size=64,
                     max_input_len=512,
-                    max_output_len=200,
+                    max_seq_len=712,
                     builder_opt=None,
                 )),
     "qwen1.5_7b_chat":
@@ -1165,7 +1185,7 @@ _allowed_configs = {
                                          inter_size=11008,
                                          max_batch_size=128,
                                          max_input_len=512,
-                                         max_output_len=200,
+                                         max_seq_len=712,
                                          builder_opt=None,
                                          bias=False)),
     "qwen1.5_14b_chat":
@@ -1182,7 +1202,7 @@ _allowed_configs = {
                     inter_size=13696,
                     max_batch_size=64,
                     max_input_len=512,
-                    max_output_len=200,
+                    max_seq_len=712,
                     builder_opt=None,
                 )),
     "mamba_2.8b":
@@ -1198,7 +1218,7 @@ _allowed_configs = {
                     n_positions=8192,
                     max_batch_size=64,
                     max_input_len=1024,
-                    max_output_len=1024,
+                    max_seq_len=2048,
                     state_size=16,
                     conv_kernel=4,
                     rnn_hidden_size=5120,
@@ -1218,7 +1238,7 @@ _allowed_configs = {
                     n_positions=8192,
                     max_batch_size=64,
                     max_input_len=1024,
-                    max_output_len=1024,
+                    max_seq_len=2048,
                     state_size=16,
                     conv_kernel=4,
                     rnn_hidden_size=4096,
@@ -1238,7 +1258,7 @@ _allowed_configs = {
                     n_positions=8192,
                     max_batch_size=64,
                     max_input_len=1024,
-                    max_output_len=1024,
+                    max_seq_len=2048,
                     state_size=16,
                     conv_kernel=4,
                     rnn_hidden_size=3072,
@@ -1258,7 +1278,7 @@ _allowed_configs = {
                     n_positions=8192,
                     max_batch_size=64,
                     max_input_len=1024,
-                    max_output_len=1024,
+                    max_seq_len=2048,
                     state_size=16,
                     conv_kernel=4,
                     rnn_hidden_size=2048,
@@ -1278,7 +1298,7 @@ _allowed_configs = {
                     n_positions=8192,
                     max_batch_size=64,
                     max_input_len=1024,
-                    max_output_len=1024,
+                    max_seq_len=2048,
                     state_size=16,
                     conv_kernel=4,
                     rnn_hidden_size=1536,
@@ -1303,7 +1323,7 @@ _allowed_configs = {
                     max_batch_size=8,
                     max_encoder_input_len=1500,
                     max_decoder_input_len=1,
-                    max_output_len=200,
+                    max_seq_len=201,
                     builder_opt=None,
                 )),
     "recurrentgemma_2b":
@@ -1321,7 +1341,7 @@ _allowed_configs = {
                     n_positions=8192,
                     max_batch_size=64,
                     max_input_len=1024,
-                    max_output_len=1024,
+                    max_seq_len=2048,
                     position_embedding_type='rope_gpt_neox',
                     rotary_pct=0.5,
                     conv_kernel=4,
