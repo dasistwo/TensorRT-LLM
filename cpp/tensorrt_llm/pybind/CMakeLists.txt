@@ -31,7 +31,9 @@ set(SRCS
     batch_manager/inferenceRequest.cpp
     batch_manager/namedTensor.cpp
     executor/bindings.cpp
-    executor/executor.cpp)
+    executor/executor.cpp
+    runtime/generationInput.cpp
+    runtime/generationOutput.cpp)
 
 pybind11_add_module(${TRTLLM_PYBIND_MODULE} ${SRCS})
 

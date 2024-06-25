@@ -24,14 +24,15 @@ from typing import Union
 
 import torch
 
+from .._common import check_max_num_tokens
 from ..auto_parallel import infer_cluster_config
 from ..auto_parallel.cluster_info import cluster_infos
 from ..builder import BuildConfig, Engine, build
 from ..logger import logger
 from ..lora_manager import LoraConfig, LoraManager
-from ..models import MODEL_MAP, PretrainedConfig
+from ..models import PretrainedConfig
 from ..models.modeling_utils import (WEIGHT_LOADER_MODELS, QuantConfig,
-                                     SpeculativeDecodingMode)
+                                     SpeculativeDecodingMode, load_model)
 from ..plugin import PluginConfig, add_plugin_argument
 from ..quantization import QuantAlgo
 
@@ -76,18 +77,11 @@ def parse_arguments():
                         type=int,
                         default='1',
                         help='The number of workers for building in parallel')
-    parser.add_argument('--max_batch_size', type=int, default=256)
+    parser.add_argument('--max_batch_size', type=int, default=1)
     parser.add_argument('--max_input_len', type=int, default=1024)
-    parser.add_argument(
-        '--max_seq_len',
-        '--max_decoder_seq_len',
-        dest='max_seq_len',
-        type=int,
-        default=2048,
-        help="Max total length of context and generated sequence")
-    parser.add_argument('--max_output_len', type=int, default=None)
+    parser.add_argument('--max_output_len', type=int, default=1024)
     parser.add_argument('--max_beam_width', type=int, default=1)
-    parser.add_argument('--max_num_tokens', type=int, default=8192)
+    parser.add_argument('--max_num_tokens', type=int, default=None)
     parser.add_argument(
         '--opt_num_tokens',
         type=int,
@@ -127,7 +121,15 @@ def parse_arguments():
                         action='store_true',
                         default=False,
                         help='Gather generation logits')
-
+    parser.add_argument(
+        '--strongly_typed',
+        action='store_true',
+        default=False,
+        help=
+        'This option is introduced with TensorRT 9.1.0.1+ and will reduce the engine building time. '
+        'It\'s not expected to see performance or accuracy regression after enable this flag. '
+        'Note that, we may remove this flag in the future, and enable the feature by default.'
+    )
     parser.add_argument('--builder_opt', type=int, default=None)
     parser.add_argument('--logits_dtype',
                         type=str,
@@ -264,7 +266,17 @@ def build_model(build_config: BuildConfig,
                 model_config: Union[str, PretrainedConfig] = None,
                 model_cls=None,
                 **kwargs) -> Engine:
-    model_config = copy.deepcopy(model_config)
+    if ckpt_dir is not None:
+        model_config = PretrainedConfig.from_json_file(
+            os.path.join(ckpt_dir, 'config.json'))
+    else:
+        assert model_config is not None
+        if isinstance(model_config, PretrainedConfig):
+            model_config = model_config
+        else:
+            model_config = PretrainedConfig.from_json_file(model_config)
+
+    preprocess_model_config(model_config, **kwargs)
 
     logits_dtype = kwargs.get('logits_dtype')
     if logits_dtype is not None:
@@ -283,9 +295,6 @@ def build_model(build_config: BuildConfig,
         "StreamingLLM is only supported in the llama model."
     real_rank = rank
 
-    if build_config.plugin_config.reduce_fusion and model_config.mapping.tp_size == 1:
-        build_config.plugin_config.reduce_fusion = False
-
     model_config.mapping.gpus_per_node = build_config.auto_parallel_config.gpus_per_node
     if build_config.auto_parallel_config.enabled:
         assert rank < build_config.auto_parallel_config.world_size
@@ -298,15 +307,7 @@ def build_model(build_config: BuildConfig,
 
     rank_config = copy.deepcopy(model_config)
     rank_config.set_rank(rank)
-
-    if model_cls is None:
-        assert architecture in MODEL_MAP, \
-            f"Unsupported model architecture: {architecture}"
-        model_cls = MODEL_MAP[architecture]
-    if ckpt_dir is None:
-        model = model_cls(rank_config)
-    else:
-        model = model_cls.from_checkpoint(ckpt_dir, config=rank_config)
+    model = load_model(rank_config, ckpt_dir, model_cls)
     is_checkpoint_pruned = getattr(rank_config, 'is_pruned', False)
 
     if build_config.plugin_config.lora_plugin is not None:
@@ -352,14 +353,14 @@ def parallel_build(ckpt_dir_or_model_config: str,
                    log_level: str = 'info',
                    model_cls=None,
                    **kwargs):
+    ckpt_dir = ckpt_dir_or_model_config
     if ckpt_dir_or_model_config.lower().endswith('.json'):
-        config_path = ckpt_dir_or_model_config
+        model_config = PretrainedConfig.from_json_file(ckpt_dir_or_model_config)
         ckpt_dir = None
     else:
-        config_path = os.path.join(ckpt_dir_or_model_config, 'config.json')
-        ckpt_dir = ckpt_dir_or_model_config
+        model_config = PretrainedConfig.from_json_file(
+            os.path.join(ckpt_dir_or_model_config, 'config.json'))
 
-    model_config = PretrainedConfig.from_json_file(config_path)
     preprocess_model_config(model_config, **kwargs)
 
     if build_config.auto_parallel_config.enabled:
@@ -416,7 +417,6 @@ def main():
     workers = min(torch.cuda.device_count(), args.workers)
 
     plugin_config = PluginConfig.from_arguments(args)
-
     kwargs = {
         'logits_dtype': args.logits_dtype,
         'use_fused_mlp': args.use_fused_mlp,
@@ -436,31 +436,24 @@ def main():
             raise RuntimeError(
                 "multiple_profiles is enabled, while opt_num_tokens is set. "
                 "They are not supposed to be working in the same time for now.")
+        args.max_num_tokens, args.opt_num_tokens = check_max_num_tokens(
+            max_num_tokens=args.max_num_tokens,
+            opt_num_tokens=args.opt_num_tokens,
+            max_batch_size=args.max_batch_size,
+            max_input_len=args.max_input_len,
+            max_beam_width=args.max_beam_width,
+            remove_input_padding=(args.remove_input_padding == "enable"),
+            enable_context_fmha=(args.context_fmha == "enable"),
+            tokens_per_block=args.tokens_per_block,
+            multiple_profiles=args.multiple_profiles)
         if args.cluster_key is not None:
             cluster_config = dict(cluster_key=args.cluster_key)
         else:
             cluster_config = infer_cluster_config()
-
-        if args.max_output_len:
-            logger.warning(
-                '--max_output_len has been deprecated in favor of --max_seq_len'
-            )
-            if args.max_input_len:
-                if args.max_seq_len:
-                    logger.warning(
-                        '--max_seq_len has been overwritten due to --max_output_len being specified'
-                    )
-                args.max_seq_len = args.max_input_len + args.max_output_len
-            else:
-                raise Exception(
-                    f"--max_output_len is specified but not --max_input_len")
-
-            del args.max_output_len
-
         build_config = BuildConfig.from_dict(
             {
                 'max_input_len': args.max_input_len,
-                'max_seq_len': args.max_seq_len,
+                'max_output_len': args.max_output_len,
                 'max_batch_size': args.max_batch_size,
                 'max_beam_width': args.max_beam_width,
                 'max_num_tokens': args.max_num_tokens,
@@ -469,7 +462,7 @@ def main():
                 args.max_prompt_embedding_table_size,
                 'gather_context_logits': args.gather_context_logits,
                 'gather_generation_logits': args.gather_generation_logits,
-                'strongly_typed': True,
+                'strongly_typed': args.strongly_typed,
                 'builder_opt': args.builder_opt,
                 'weight_sparsity': args.weight_sparsity,
                 'profiling_verbosity': args.profiling_verbosity,

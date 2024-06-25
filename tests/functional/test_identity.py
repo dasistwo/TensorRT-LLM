@@ -16,18 +16,19 @@ import os
 import sys
 import unittest
 
+import numpy as np
 import torch
 from parameterized import parameterized
+from polygraphy.backend.trt import CreateConfig, EngineFromNetwork, TrtRunner
 
 import tensorrt_llm
 from tensorrt_llm import Tensor
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-from utils.util import (create_session, run_session, skip_bf16_pre_ampere,
-                        unittest_name_func)
+from utils.util import skip_bf16_pre_ampere, unittest_name_func
 
 
-class TestIdentity(unittest.TestCase):
+class TestFunctional(unittest.TestCase):
 
     def setUp(self):
         tensorrt_llm.logger.set_level('error')
@@ -41,29 +42,27 @@ class TestIdentity(unittest.TestCase):
         skip_bf16_pre_ampere(dtype)
 
         x_data = torch.randn(
-            (4, 6, 3, 4),
-            dtype=tensorrt_llm._utils.str_dtype_to_torch(dtype),
-            device="cuda")
-
-        # construct trt network
+            (4, 6, 3, 4), dtype=tensorrt_llm._utils.str_dtype_to_torch(dtype))
         builder = tensorrt_llm.Builder()
-        network = builder.create_network()
+        net = builder.create_network()
         if use_plugin:
-            network.plugin_config.identity_plugin = dtype
-
-        with tensorrt_llm.net_guard(network):
+            net.plugin_config.identity_plugin = dtype
+        with tensorrt_llm.net_guard(net):
+            network = tensorrt_llm.default_trtnet()
             x = Tensor(name='x',
                        shape=x_data.shape,
                        dtype=tensorrt_llm.str_dtype_to_trt(dtype))
-            output = tensorrt_llm.functional.identity(x)
-            output.mark_output('output', dtype)
+            output = tensorrt_llm.functional.identity(x).trt_tensor
+            output.name = 'output'
+            network.mark_output(output)
+            output.dtype = tensorrt_llm.str_dtype_to_trt(dtype)
 
-        # trt run
-        session = create_session(builder, network, precision=dtype)
-        inputs = {
-            'x': x_data,
-        }
-        outputs = run_session(session, inputs)
+        build_engine = EngineFromNetwork(
+            (builder.trt_builder, net.trt_network),
+            config=CreateConfig(fp16=(dtype == 'float16'),
+                                bf16=(dtype == 'bfloat16')))
+        with TrtRunner(build_engine) as runner:
+            outputs = runner.infer(feed_dict={'x': x_data})
 
-        # compare diff
-        torch.testing.assert_close(x_data, outputs['output'])
+        np.testing.assert_allclose(x_data.to(torch.float32),
+                                   outputs['output'].to(torch.float32))

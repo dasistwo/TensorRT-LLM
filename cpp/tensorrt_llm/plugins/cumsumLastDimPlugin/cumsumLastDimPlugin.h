@@ -27,9 +27,7 @@ namespace tensorrt_llm::plugins
 class CumsumLastDimPlugin : public BasePlugin
 {
 public:
-    using SizeType32 = tensorrt_llm::kernels::SizeType32;
-
-    CumsumLastDimPlugin(SizeType32 inputLength, nvinfer1::DataType type, size_t tempStorageBytes = 0);
+    CumsumLastDimPlugin(int mInputLength, nvinfer1::DataType type);
     CumsumLastDimPlugin(void const* data, size_t length);
     ~CumsumLastDimPlugin() override = default;
     // IPluginV2DynamicExt Methods
@@ -47,7 +45,6 @@ public:
     template <typename T>
     int enqueueImpl(nvinfer1::PluginTensorDesc const* inputDesc, nvinfer1::PluginTensorDesc const* outputDesc,
         void const* const* inputs, void* const* outputs, void* workspace, cudaStream_t stream);
-    size_t getWorkspaceSizeNeeded(SizeType32 inputLength, nvinfer1::DataType type);
 
     // IPluginV2Ext Methods
     nvinfer1::DataType getOutputDataType(
@@ -72,8 +69,7 @@ private:
     };
 
 private:
-    SizeType32 mInputLength;
-    size_t mTempStorageBytes;
+    int mInputLength;
     nvinfer1::DataType mType;
 };
 

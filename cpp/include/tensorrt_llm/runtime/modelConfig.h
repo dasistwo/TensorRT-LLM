@@ -18,12 +18,11 @@
 
 #include "tensorrt_llm/common/quantization.h"
 #include "tensorrt_llm/runtime/common.h"
+#include "tensorrt_llm/runtime/lookaheadModule.h"
 #include "tensorrt_llm/runtime/loraModule.h"
+#include "tensorrt_llm/runtime/medusaModule.h"
 #include "tensorrt_llm/runtime/speculativeDecodingMode.h"
-#include "tensorrt_llm/runtime/speculativeDecodingModule.h"
-
 #include <NvInferRuntime.h>
-#include <array>
 
 namespace tensorrt_llm::runtime
 {
@@ -31,19 +30,12 @@ namespace tensorrt_llm::runtime
 class ModelConfig
 {
 public:
-    // See `split_point` defined in `tensorrt_llm/models/generation_mixin.py`.
-    // The split points are tuned to get better perf, if we need to let
-    // users tune that, we can support that by writing and reading the
-    // points in `config.json`.
-    static constexpr std::array kOPT_PROFILES_SPLIT_POINTS{64, 128, 256, 512, 1024};
-
     enum class ModelVariant : std::int32_t
     {
         kGpt = 0,
         kGlm = 1,            // https://github.com/THUDM/GLM and https://github.com/THUDM/ChatGLM-6B
         kMamba = 2,          // https://github.com/state-spaces/mamba
         kRecurrentGemma = 3, // https://github.com/google-deepmind/recurrentgemma
-        kEncDec = 4,
     };
 
     struct RnnConfig
@@ -87,23 +79,15 @@ public:
         , mUseCustomAllReduce(false)
         , mMaxPromptEmbeddingTableSize(0)
         , mMaxDraftLen(0)
-        , mContextFMHA(false)
         , mPagedContextFMHA(false)
         , mUseXQA{false}
         , mUseLoraPlugin(false)
         , mMlpHiddenSize(0)
         , mUseCrossAttention(false)
-        , mUsePositionEmbedding(false)
+        , mUsePositionEmbedding(true) // TODO: remove these two properties?
         , mUseTokenTypeEmbedding(false)
         , mSpeculativeDecodingMode(SpeculativeDecodingMode::None())
-        , mLogitsDtype(nvinfer1::DataType::kFLOAT)
-        , mUseShapeInference(true)
     {
-    }
-
-    [[nodiscard]] static std::vector<SizeType32> getOptProfilesSplitPoints() noexcept
-    {
-        return {kOPT_PROFILES_SPLIT_POINTS.begin(), kOPT_PROFILES_SPLIT_POINTS.end()};
     }
 
     [[nodiscard]] SizeType32 constexpr getVocabSize() const noexcept
@@ -146,16 +130,6 @@ public:
     [[nodiscard]] SizeType32 constexpr getHiddenSize() const noexcept
     {
         return mHiddenSize;
-    }
-
-    [[nodiscard]] SizeType32 constexpr getEncoderHiddenSize() const noexcept
-    {
-        return mEncoderHiddenSize;
-    }
-
-    void constexpr setEncoderHiddenSize(SizeType32 encoderHiddenSize) noexcept
-    {
-        mEncoderHiddenSize = encoderHiddenSize;
     }
 
     [[nodiscard]] SizeType32 constexpr getSizePerHead() const noexcept
@@ -299,16 +273,6 @@ public:
         mMaxNumTokens = maxNumTokens;
     }
 
-    [[nodiscard]] SizeType32 constexpr getMaxEncoderLen() const noexcept
-    {
-        return mMaxEncoderLen;
-    }
-
-    void constexpr setMaxEncoderLen(SizeType32 maxEncoderLen) noexcept
-    {
-        mMaxEncoderLen = maxEncoderLen;
-    }
-
     [[nodiscard]] bool constexpr usePromptTuning() const noexcept
     {
         return mMaxPromptEmbeddingTableSize > 0;
@@ -379,16 +343,6 @@ public:
         return mMaxDraftLen + 1;
     }
 
-    void constexpr setContextFMHA(bool contextFMHA) noexcept
-    {
-        mContextFMHA = contextFMHA;
-    }
-
-    [[nodiscard]] bool constexpr getContextFMHA() const noexcept
-    {
-        return mContextFMHA;
-    }
-
     void constexpr setPagedContextFMHA(bool pagedContextFMHA) noexcept
     {
         mPagedContextFMHA = pagedContextFMHA;
@@ -444,9 +398,9 @@ public:
         return mUseCrossAttention;
     }
 
-    void constexpr setUseCrossAttention(bool useCrossAttention) noexcept
+    void constexpr useCrossAttention(bool newCrossAttention) noexcept
     {
-        mUseCrossAttention = useCrossAttention;
+        mUseCrossAttention = newCrossAttention;
     }
 
     [[nodiscard]] bool constexpr usePositionEmbedding() const noexcept
@@ -454,9 +408,9 @@ public:
         return mUsePositionEmbedding;
     }
 
-    void constexpr setUsePositionEmbedding(bool usePositionEmbedding) noexcept
+    void constexpr usePositionEmbedding(bool newPositionEmbedding) noexcept
     {
-        mUsePositionEmbedding = usePositionEmbedding;
+        mUsePositionEmbedding = newPositionEmbedding;
     }
 
     [[nodiscard]] bool constexpr useTokenTypeEmbedding() const noexcept
@@ -464,9 +418,19 @@ public:
         return mUseTokenTypeEmbedding;
     }
 
-    void constexpr setUseTokenTypeEmbedding(bool useTokenTypeEmbedding) noexcept
+    void constexpr useTokenTypeEmbedding(bool newTokenTypeEmbedding) noexcept
     {
-        mUseTokenTypeEmbedding = useTokenTypeEmbedding;
+        mUseTokenTypeEmbedding = newTokenTypeEmbedding;
+    }
+
+    [[nodiscard]] SizeType32 constexpr getFfnHiddenSize() const noexcept
+    {
+        return mFfnHiddenSize;
+    }
+
+    void constexpr setFfnHiddenSize(SizeType32 ffnHiddenSize) noexcept
+    {
+        mFfnHiddenSize = ffnHiddenSize;
     }
 
     [[nodiscard]] SizeType32 constexpr getMaxLoraRank() const noexcept
@@ -570,26 +534,6 @@ public:
         return mSpeculativeDecodingMode;
     }
 
-    void setLogitsDtype(nvinfer1::DataType inputDtype) noexcept
-    {
-        mLogitsDtype = inputDtype;
-    }
-
-    [[nodiscard]] nvinfer1::DataType constexpr getLogitsDtype() const noexcept
-    {
-        return mLogitsDtype;
-    }
-
-    void setUseShapeInference(bool useShapeInference) noexcept
-    {
-        mUseShapeInference = useShapeInference;
-    }
-
-    [[nodiscard]] bool useShapeInference() const noexcept
-    {
-        return mUseShapeInference;
-    }
-
 private:
     SizeType32 mVocabSize;
     SizeType32 mNbAttentionLayers;
@@ -618,10 +562,8 @@ private:
     bool mUseCustomAllReduce;
 
     SizeType32 mMaxPromptEmbeddingTableSize;
-    // TODO(rkobus): remove this from ModelConfig and use mSpeculativeDecodingModule
     SizeType32 mMaxDraftLen;
 
-    bool mContextFMHA;
     bool mPagedContextFMHA;
     bool mUseXQA;
 
@@ -633,20 +575,15 @@ private:
     std::optional<RnnConfig> mRnnConfig;
 
     // Configs related to encoder / enc-dec models
-    SizeType32 mMaxEncoderLen{};
-    SizeType32 mEncoderHiddenSize{};
     bool mUseCrossAttention;
     bool mUsePositionEmbedding;
     bool mUseTokenTypeEmbedding;
+    SizeType32 mFfnHiddenSize; // indicates encoder output hidden size
 
     std::vector<LayerType> mLayerTypes;
     // Speculative decoding members
     std::shared_ptr<SpeculativeDecodingModule> mSpeculativeDecodingModule;
     SpeculativeDecodingMode mSpeculativeDecodingMode;
-
-    // Logits datatype
-    nvinfer1::DataType mLogitsDtype;
-    bool mUseShapeInference;
 };
 
 } // namespace tensorrt_llm::runtime

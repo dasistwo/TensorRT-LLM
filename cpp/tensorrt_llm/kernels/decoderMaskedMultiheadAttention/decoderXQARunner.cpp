@@ -36,9 +36,10 @@ namespace tensorrt_llm
 namespace kernels
 {
 
-DecoderXQARunner::DecoderXQARunner(
-    const XQADataType data_type, int num_heads, int num_kv_heads, int head_size, bool multi_block_mode)
-    : mDataType(data_type)
+DecoderXQARunner::DecoderXQARunner(Resource* resource, const XQADataType data_type, int num_heads, int num_kv_heads,
+    int head_size, bool multi_block_mode)
+    : mResource(resource)
+    , mDataType(data_type)
     , mNumHeads(num_heads)
     , mNumKVHeads(num_kv_heads)
     , mHeadSize(head_size)
@@ -72,11 +73,9 @@ constexpr inline T roundUp(T a, T b)
 
 } // namespace
 
-size_t DecoderXQARunner::getWorkspaceSize(int max_batch_beam_size, int max_num_tokens)
+size_t DecoderXQARunner::getWorkspaceSize(int max_batch_beam_size)
 {
-    // buffer for RoPE / output quantization.
-    constexpr size_t kXQA_OUT_ELEM_SIZE = 2; // fp16 or bf16.
-    size_t workspace_size = kXQA_OUT_ELEM_SIZE * mHeadSize * mNumHeads * max_num_tokens;
+    size_t workspace_size = 0;
     if (mMultiBlockMode)
     {
         int workspaces[4];
@@ -91,8 +90,7 @@ size_t DecoderXQARunner::getWorkspaceSize(int max_batch_beam_size, int max_num_t
             = roundUp<int32_t>(sizeof(__half) * kMaxBeamWidth * group_size * mHeadSize, 128);
         workspaces[3] = multi_block_workspace_alignment * xqaMaxNbCtaPerKVHeadFactor() * mNumKVHeads
             * divUp(max_batch_beam_size, kMaxBeamWidth);
-        workspace_size = roundUp<size_t>(workspace_size, multi_block_workspace_alignment)
-            + roundUp(workspaces[0], multi_block_workspace_alignment)
+        workspace_size = roundUp(workspaces[0], multi_block_workspace_alignment)
             + roundUp(workspaces[1], multi_block_workspace_alignment)
             + roundUp(workspaces[2], multi_block_workspace_alignment)
             + roundUp(workspaces[3], multi_block_workspace_alignment)
@@ -103,12 +101,18 @@ size_t DecoderXQARunner::getWorkspaceSize(int max_batch_beam_size, int max_num_t
 
 DecoderXQAImpl* DecoderXQARunner::getImplFromXQAParams(XQAParams const& xqaParams)
 {
+    if (tensorrt_llm::common::getSMVersion() == kSM_90)
+    {
+        // Always use Precompiled impl for sm90 until Hopper XQA source gets integrated to JIT codepath.
+        return mPrecompiledImpl.get();
+    }
     if (xqaParams.multi_query_tokens)
     {
         // Use precompiled cubin for medusa, because medusa cubins are generated from a different CUDA source file than
         // non-medusa.
         return mPrecompiledImpl.get();
     }
+
     if (tensorrt_llm::common::getEnvEnableXQAJIT())
     {
         return mJITImpl.get();
@@ -134,12 +138,6 @@ void DecoderXQARunner::run(
     XQAParams const& xqa_params, KVCacheBuffer const& kv_cache_buffer, cudaStream_t const& stream)
 {
     return getImplFromXQAParams(xqa_params)->run(xqa_params, kv_cache_buffer, stream);
-}
-
-DecoderXQARunner::Resource* DecoderXQARunner::getResourceGlobal()
-{
-    static DecoderXQARunner::Resource sResource;
-    return &sResource;
 }
 
 template void DecoderXQARunner::run(

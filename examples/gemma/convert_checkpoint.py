@@ -51,12 +51,6 @@ def parse_arguments():
         help=
         "help='Quantize weights for the various GEMMs to INT4/INT8. Define the precision for the weights.",
     )
-    parser.add_argument(
-        "--use-int8-weight-only-embedding",
-        action="store_true",
-        help=
-        "Use weight only on embedding table and lm_head. (Only supported on Hopper GPU)",
-    )
     parser.add_argument("--dtype",
                         type=str,
                         choices=["float32", "bfloat16", "float16"])
@@ -831,8 +825,8 @@ def convert_from_checkpoint(
                         tp_rank,
                         dim=trt_llm_config.embedding_sharding_dim,
                     )
-                if trt_llm_config.quant_mode.is_int8_weight_only() and not trt_llm_config.quant_mode.has_per_group_scaling() and \
-                    not trt_llm_config.quant_mode.has_int8_kv_cache() and trt_llm_config.quantization.exclude_modules is not None:
+                if trt_llm_config.quant_mode.is_weight_only() and not trt_llm_config.quant_mode.has_per_group_scaling() and \
+                    not trt_llm_config.quant_mode.has_int8_kv_cache():
 
                     # shape of embedding table: [V, K], V: vocab size, K: embedding dim
 
@@ -1006,10 +1000,13 @@ def main():
     quant_kwargs.update(quant_algo=quant_algo,
                         kv_cache_quant_algo=kv_cache_quant_algo)
     if args.use_weight_only_with_precision:
-        if args.use_weight_only_with_precision.endswith(
-                "awq") or args.use_weight_only_with_precision.endswith(
-                    "int4") or not args.use_int8_weight_only_embedding:
-            quant_kwargs.update(has_zero_point=False, pre_quant_scale=True)
+        if args.use_weight_only_with_precision.endswith("awq"):
+            quant_kwargs.update(has_zero_point=False,
+                                pre_quant_scale=True,
+                                exclude_modules=[
+                                    'lm_head', 'router', 'vocab_embedding',
+                                    'position_embedding', 'block_embedding'
+                                ])
         else:
             quant_kwargs.update(exclude_modules=['router'])
 
@@ -1017,7 +1014,7 @@ def main():
     quant_config.quant_algo = quant_kwargs['quant_algo']
     quant_config.kv_cache_quant_algo = quant_kwargs['kv_cache_quant_algo']
     if args.use_weight_only_with_precision:
-        quant_config.exclude_modules = quant_kwargs.get('exclude_modules')
+        quant_config.exclude_modules = quant_kwargs['exclude_modules']
         if args.use_weight_only_with_precision.endswith("awq"):
             quant_config.group_size = 128
             quant_config.has_zero_point = quant_kwargs['has_zero_point']

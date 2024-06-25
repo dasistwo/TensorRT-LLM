@@ -85,11 +85,7 @@ bool QuantizePerTokenPlugin::supportsFormatCombination(
     {
     case 0:
         // activation
-        return (inOut[pos].type == nvinfer1::DataType::kFLOAT || inOut[pos].type == nvinfer1::DataType::kHALF
-#ifdef ENABLE_BF16
-                   || inOut[pos].type == nvinfer1::DataType::kBF16
-#endif
-                   )
+        return (inOut[pos].type == nvinfer1::DataType::kFLOAT || inOut[pos].type == nvinfer1::DataType::kHALF)
             && inOut[pos].format == TensorFormat::kLINEAR;
     case 1:
         // quantized activation
@@ -137,18 +133,11 @@ int QuantizePerTokenPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
         invokePerTokenQuantization<float>(reinterpret_cast<int8_t*>(outputs[0]),
             reinterpret_cast<float const*>(inputs[0]), m, k, reinterpret_cast<float*>(outputs[1]), stream);
     }
-    else if (inputDesc[0].type == DataType::kHALF)
+    else
     {
         invokePerTokenQuantization<half>(reinterpret_cast<int8_t*>(outputs[0]),
             reinterpret_cast<half const*>(inputs[0]), m, k, reinterpret_cast<float*>(outputs[1]), stream);
     }
-#ifdef ENABLE_BF16
-    else if (inputDesc[0].type == DataType::kBF16)
-    {
-        invokePerTokenQuantization<__nv_bfloat16>(reinterpret_cast<int8_t*>(outputs[0]),
-            reinterpret_cast<__nv_bfloat16 const*>(inputs[0]), m, k, reinterpret_cast<float*>(outputs[1]), stream);
-    }
-#endif
 
     return 0;
 }

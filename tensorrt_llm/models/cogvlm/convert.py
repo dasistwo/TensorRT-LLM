@@ -26,7 +26,8 @@ def convert_hf_cogvlm(hf_model,
                       int8_kv_cache=False,
                       act_range=[],
                       qkv_para=[],
-                      smoother=[]):
+                      smoother=[],
+                      moe_config=None):
 
     weights = {}
     tik = time.time()

@@ -15,7 +15,6 @@
 #include "tensorrt_llm/batch_manager/common.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h"
 #include "tensorrt_llm/batch_manager/peftCacheManagerConfig.h"
-#include "tensorrt_llm/common/tllmException.h"
 #include "tensorrt_llm/runtime/loraCache.h"
 #include "tensorrt_llm/runtime/modelConfig.h"
 #include "tensorrt_llm/runtime/workerPool.h"
@@ -35,7 +34,7 @@ namespace tensorrt_llm::batch_manager
 
 using runtime::SizeType32;
 
-class PeftTaskNotCachedException : public runtime::LoraExpectedException
+class PeftTaskNotCachedException : public std::runtime_error
 {
 public:
     explicit PeftTaskNotCachedException(std::string const& msg);

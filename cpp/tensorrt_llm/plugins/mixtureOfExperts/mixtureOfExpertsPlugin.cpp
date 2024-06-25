@@ -39,7 +39,7 @@ std::vector<nvinfer1::PluginField> MixtureOfExpertsPluginCreator::mPluginAttribu
 MixtureOfExpertsPlugin::MixtureOfExpertsPlugin(int number_of_experts, int top_k, int expert_hidden_size,
     int expert_inter_size, tensorrt_llm::ActivationType activation_type, nvinfer1::DataType type,
     nvinfer1::DataType weight_type, nvinfer1::DataType output_type, QuantMode quant_mode, bool use_finished,
-    bool use_bias, int tp_size, int tp_rank, int ep_size, int ep_rank,
+    bool use_bias, int tp_size, int tp_rank, MOEParallelismMode parallelism_mode,
     MOEExpertScaleNormalizationMode normalization_mode, MixtureOfExpertsPluginProfilerPtr plugin_profiler_ptr)
     : mNumExperts(number_of_experts)
     , mK(top_k)
@@ -52,7 +52,9 @@ MixtureOfExpertsPlugin::MixtureOfExpertsPlugin(int number_of_experts, int top_k,
     , mQuantMode(quant_mode)
     , mUseFinished(use_finished)
     , mUseBias(use_bias)
-    , mParallelismConfig(MOEParallelismConfig{tp_size, tp_rank, ep_size, ep_rank})
+    , mTPSize(tp_size)
+    , mTPRank(tp_rank)
+    , mParallelismMode(parallelism_mode)
     , mNormalizationMode(normalization_mode)
     , mPluginProfiler(std::move(plugin_profiler_ptr))
 {
@@ -72,7 +74,9 @@ tensorrt_llm::plugins::MixtureOfExpertsPlugin::MixtureOfExpertsPlugin(MixtureOfE
     , mQuantMode(other.mQuantMode)
     , mUseFinished(other.mUseFinished)
     , mUseBias(other.mUseBias)
-    , mParallelismConfig(other.mParallelismConfig)
+    , mTPSize(other.mTPSize)
+    , mTPRank(other.mTPRank)
+    , mParallelismMode(other.mParallelismMode)
     , mNormalizationMode(other.mNormalizationMode)
     , mDims(other.mDims)
     , mGemmId(other.mGemmId)
@@ -87,8 +91,9 @@ size_t MixtureOfExpertsPlugin::getSerializationSize() const noexcept
 {
     return sizeof(mNumExperts) + sizeof(mK) + sizeof(mExpertHiddenSize) + sizeof(mExpertInterSize)
         + sizeof(mActivationType) + sizeof(mType) + sizeof(mWeightType) + sizeof(mOutputType)
-        + sizeof(QuantMode::BaseType) + sizeof(mUseFinished) + sizeof(mUseBias) + sizeof(mParallelismConfig)
-        + sizeof(mNormalizationMode) + sizeof(mDims) + mPluginProfiler->getSerializationSize(mGemmId);
+        + sizeof(QuantMode::BaseType) + sizeof(mUseFinished) + sizeof(mUseBias) + sizeof(mTPSize) + sizeof(mTPRank)
+        + sizeof(mParallelismMode) + sizeof(mNormalizationMode) + sizeof(mDims)
+        + mPluginProfiler->getSerializationSize(mGemmId);
 }
 
 MixtureOfExpertsPlugin::MixtureOfExpertsPlugin(
@@ -110,7 +115,9 @@ MixtureOfExpertsPlugin::MixtureOfExpertsPlugin(
     mQuantMode = QuantMode{quant_mode};
     read(d, mUseFinished);
     read(d, mUseBias);
-    read(d, mParallelismConfig);
+    read(d, mTPSize);
+    read(d, mTPRank);
+    read(d, mParallelismMode);
     read(d, mNormalizationMode);
     read(d, mDims);
 
@@ -139,7 +146,9 @@ void MixtureOfExpertsPlugin::serialize(void* buffer) const noexcept
     write(d, mQuantMode.value());
     write(d, mUseFinished);
     write(d, mUseBias);
-    write(d, mParallelismConfig);
+    write(d, mTPSize);
+    write(d, mTPRank);
+    write(d, mParallelismMode);
     write(d, mNormalizationMode);
     write(d, mDims);
 
@@ -217,8 +226,8 @@ void MixtureOfExpertsPlugin::init()
             static_cast<int>(mType), static_cast<int>(mWeightType));
     }
 
-    mGemmId = GemmIDMoe{mNumExperts, mK, mParallelismConfig, mExpertHiddenSize, mExpertInterSize, mActivationType,
-        mType, mWeightType, mQuantMode};
+    mGemmId = GemmIDMoe{mNumExperts, mK, mExpertHiddenSize, mExpertInterSize, mActivationType, mType, mWeightType,
+        mQuantMode, mParallelismMode};
 }
 
 // IPluginV2DynamicExt Methods
@@ -307,8 +316,8 @@ void MixtureOfExpertsPlugin::configurePlugin(nvinfer1::DynamicPluginTensorDesc c
     {
         mDims = {minM, maxM, maxN, maxK};
     }
-    mGemmId = GemmIDMoe{mNumExperts, mK, mParallelismConfig, mExpertHiddenSize, mExpertInterSize, mActivationType,
-        mType, mWeightType, mQuantMode};
+    mGemmId = GemmIDMoe{mNumExperts, mK, mExpertHiddenSize, mExpertInterSize, mActivationType, mType, mWeightType,
+        mQuantMode, mParallelismMode};
 }
 
 auto MixtureOfExpertsPlugin::setupWorkspace(void* base_ptr, int64_t num_tokens) const -> WorkspaceInfo
@@ -316,7 +325,7 @@ auto MixtureOfExpertsPlugin::setupWorkspace(void* base_ptr, int64_t num_tokens) 
     size_t dtype_size = tensorrt_llm::common::getDTypeSize(mType);
 
     size_t moe_workspace_size = mMOERunner->getWorkspaceSize(
-        num_tokens, mExpertHiddenSize, mExpertInterSize, mNumExperts, mK, mActivationType, mParallelismConfig);
+        num_tokens, mExpertHiddenSize, mExpertInterSize, mNumExperts, mK, mActivationType, getParallelismConfig());
 
     // Output of post-softmax routing probabilities
     size_t scale_probabilities_size = num_tokens * mNumExperts * sizeof(float);
@@ -373,7 +382,16 @@ size_t MixtureOfExpertsPlugin::getWorkspaceSize(nvinfer1::PluginTensorDesc const
 
 MOEParallelismConfig MixtureOfExpertsPlugin::getParallelismConfig() const
 {
-    return mParallelismConfig;
+    switch (mParallelismMode)
+    {
+    case kernels::MOEParallelismMode::NONE: return {};
+    case kernels::MOEParallelismMode::EXPERT_PARALLELISM:
+        return MOEParallelismConfig::ExpertParallelism(mTPSize, mTPRank);
+    case kernels::MOEParallelismMode::TENSOR_PARALLELISM:
+        return MOEParallelismConfig::TensorParallelism(mTPSize, mTPRank);
+    }
+    assert(false);
+    return {};
 }
 
 QuantParams tensorrt_llm::plugins::MixtureOfExpertsPlugin::getQuantParams(
@@ -400,13 +418,14 @@ int MixtureOfExpertsPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
 {
     int64_t const num_tokens = getNumTokens(inputDesc);
     int64_t const num_not_finished = num_tokens; // TODO Take this as an input
+    auto parallelism_config = getParallelismConfig();
 
     auto workspace = setupWorkspace(workspace_ptr, num_tokens);
 
     auto w1_desc = inputDesc[getExpertWeights1Index()];
     auto w2_desc = inputDesc[getExpertWeights2Index()];
     TLLM_CHECK(w1_desc.dims.nbDims == 3);
-    size_t experts_per_node = mNumExperts / mParallelismConfig.ep_size;
+    size_t experts_per_node = mNumExperts / parallelism_config.ep_size;
     TLLM_CHECK(w1_desc.dims.d[0] == experts_per_node);
     TLLM_CHECK(w2_desc.dims.nbDims == 3);
     TLLM_CHECK(w2_desc.dims.d[0] == experts_per_node);
@@ -450,7 +469,7 @@ int MixtureOfExpertsPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
         outputs[getOutputTensorIndex()],
         hasFinishedTensor() ? static_cast<bool const*>(inputs[getFinishedTensorIndex()]) : nullptr, num_not_finished,
         workspace.scale_probs, static_cast<int*>(workspace.src_to_dest_map),
-        static_cast<int*>(workspace.selected_experts), mParallelismConfig, mNormalizationMode, stream);
+        static_cast<int*>(workspace.selected_experts), parallelism_config, mNormalizationMode, stream);
 
     return 0;
 }
@@ -537,8 +556,8 @@ MixtureOfExpertsPluginCreator::MixtureOfExpertsPluginCreator()
     mPluginAttributes.emplace_back(nvinfer1::PluginField("use_bias", nullptr, PluginFieldType::kINT32, 0));
     mPluginAttributes.emplace_back(nvinfer1::PluginField("tp_size", nullptr, PluginFieldType::kINT32, 1));
     mPluginAttributes.emplace_back(nvinfer1::PluginField("tp_rank", nullptr, PluginFieldType::kINT32, 0));
-    mPluginAttributes.emplace_back(nvinfer1::PluginField("ep_size", nullptr, PluginFieldType::kINT32, 1));
-    mPluginAttributes.emplace_back(nvinfer1::PluginField("ep_rank", nullptr, PluginFieldType::kINT32, 0));
+    mPluginAttributes.emplace_back(nvinfer1::PluginField(
+        "parallelism_mode", nullptr, PluginFieldType::kINT32, static_cast<int>(MOEParallelismMode::NONE)));
     mPluginAttributes.emplace_back(nvinfer1::PluginField("normalization_mode", nullptr, PluginFieldType::kINT32,
         static_cast<int>(MOEExpertScaleNormalizationMode::NONE)));
     mFC.nbFields = mPluginAttributes.size();
@@ -562,8 +581,7 @@ IPluginV2* MixtureOfExpertsPluginCreator::createPlugin(
     int mUseBias{0};
     int mTPSize{};
     int mTPRank{};
-    int mEPSize{};
-    int mEPRank{};
+    int mParallelismMode{};
     int mNormalizationMode{};
 
     // Read configurations from each fields
@@ -586,8 +604,7 @@ IPluginV2* MixtureOfExpertsPluginCreator::createPlugin(
         MapPair{"quant_mode", std::ref(mQuantMode)},
         MapPair{"tp_size", std::ref(mTPSize)},
         MapPair{"tp_rank", std::ref(mTPRank)},
-        MapPair{"ep_size", std::ref(mEPSize)},
-        MapPair{"ep_rank", std::ref(mEPRank)},
+        MapPair{"parallelism_mode", std::ref(mParallelismMode)},
         MapPair{"normalization_mode", std::ref(mNormalizationMode)},
 
         // Optional
@@ -629,7 +646,8 @@ IPluginV2* MixtureOfExpertsPluginCreator::createPlugin(
             mNumExperts, mK, mExpertHiddenSize, mExpertInterSize,
             static_cast<tensorrt_llm::ActivationType>(mActivationType), static_cast<nvinfer1::DataType>(mType),
             static_cast<nvinfer1::DataType>(mWeightType), static_cast<nvinfer1::DataType>(mOutputType),
-            QuantMode(mQuantMode), mUseFinished != 0, mUseBias != 0, mTPSize, mTPRank, mEPSize, mEPRank,
+            QuantMode(mQuantMode), mUseFinished != 0, mUseBias != 0, mTPSize, mTPRank,
+            static_cast<MOEParallelismMode>(mParallelismMode),
             static_cast<MOEExpertScaleNormalizationMode>(mNormalizationMode), pluginProfiler);
         obj->setPluginNamespace(mNamespace.c_str());
         return obj;

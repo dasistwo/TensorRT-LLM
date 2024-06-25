@@ -16,12 +16,15 @@
  */
 
 #include "tensorrt_llm/layers/decodingLayer.h"
-#include "tensorrt_llm/layers/beamSearchLayer.h"
+#include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/common/memoryUtils.h"
+#include "tensorrt_llm/kernels/decodingCommon.h"
+#include "tensorrt_llm/kernels/samplingTopKKernels.h"
 #include "tensorrt_llm/layers/decodingParams.h"
-#include "tensorrt_llm/layers/explicitDraftTokensLayer.h"
 #include "tensorrt_llm/layers/layerUtils.h"
-#include "tensorrt_llm/layers/medusaDecodingLayer.h"
 #include "tensorrt_llm/layers/samplingLayer.h"
+
+#include <algorithm>
 
 using namespace tensorrt_llm::common;
 using namespace tensorrt_llm::kernels;
@@ -56,14 +59,15 @@ bool allSame(std::optional<std::vector<T>> const& vOpt)
 
 bool hasDiffRuntimeArgs(std::shared_ptr<tensorrt_llm::layers::DynamicDecodeSetupParams> const& params)
 {
-    // return !allSame(params->penaltyParams.frequencyPenalty) || !allSame(params->penaltyParams.presencePenalty)
-    //     || !allSame(params->penaltyParams.repetitionPenalty) || !allSame(params->penaltyParams.temperature)
-    //     || !allSame(params->penaltyParams.minLength) || !allSame(params->banWordsInputs.noRepeatNgramSize);
-    return false;
+    return !allSame(params->penaltyParams.frequencyPenalty) || !allSame(params->penaltyParams.presencePenalty)
+        || !allSame(params->penaltyParams.repetitionPenalty) || !allSame(params->penaltyParams.temperature)
+        || !allSame(params->penaltyParams.minLength);
 }
 } // namespace
 
-namespace tensorrt_llm::layers
+namespace tensorrt_llm
+{
+namespace layers
 {
 template <typename T>
 DecodingLayer<T>::DecodingLayer(executor::DecodingMode const& mode, DecoderDomain const& decoderDomain,
@@ -106,40 +110,60 @@ DecodingLayer<T>::DecodingLayer(executor::DecodingMode const& mode, DecoderDomai
 
 template <typename T>
 void DecodingLayer<T>::setup(SizeType32 batchSize, SizeType32 beamWidth, SizeType32 const* batchSlots,
-    std::shared_ptr<BaseSetupParams> const& baseSetupParams)
+    std::shared_ptr<BaseSetupParams> baseSetupParams)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
     auto setupParams = std::dynamic_pointer_cast<DynamicDecodeSetupParams>(baseSetupParams);
 
-    TLLM_CHECK_WITH_INFO(setupParams->decodingParams, "decodingParams for setup is not set");
-
     if (mDecodingMode.isTopKorTopP())
     { // sampling layers
         TLLM_CHECK_WITH_INFO(
             beamWidth == 1, "Decoding mode is TopK and/or TopP, but beamWidth != 1 (%d != 1)", beamWidth);
-        mDecodingLayer->setup(batchSize, beamWidth, batchSlots, setupParams->decodingParams);
+        auto samplingParams = std::make_shared<SamplingSetupParams>();
+
+        samplingParams->runtime_top_k = setupParams->samplingParams.runtime_top_k;
+        samplingParams->runtime_top_p = setupParams->samplingParams.runtime_top_p;
+        samplingParams->randomSeed = setupParams->randomSeed;
+
+        samplingParams->top_p_decay = setupParams->samplingParams.top_p_decay;
+        samplingParams->top_p_min = setupParams->samplingParams.top_p_min;
+        samplingParams->top_p_reset_ids = setupParams->samplingParams.top_p_reset_ids;
+        samplingParams->normalize_log_probs = setupParams->samplingParams.normalize_log_probs;
+        samplingParams->outputLogProbs = setupParams->samplingParams.outputLogProbs;
+        samplingParams->cumLogProbs = setupParams->samplingParams.cumLogProbs;
+
+        mDecodingLayer->setup(batchSize, beamWidth, batchSlots, samplingParams);
     }
     else if (mDecodingMode.isBeamSearch())
     { // beam search layer
         TLLM_CHECK_WITH_INFO(beamWidth > 1, "Decoding mode is beam search, but beamWidth <= 1 (%d <= 1)", beamWidth);
-        mDecodingLayer->setup(batchSize, beamWidth, nullptr, setupParams->decodingParams);
+        auto beamSearchParams = std::make_shared<BeamSearchSetupParams>();
+
+        beamSearchParams->beam_search_diversity_rate = setupParams->beamSearchParams.beam_search_diversity_rate;
+        beamSearchParams->length_penalty = setupParams->beamSearchParams.length_penalty;
+        beamSearchParams->early_stopping = setupParams->beamSearchParams.early_stopping;
+        beamSearchParams->hasDiffRuntimeArgs = hasDiffRuntimeArgs(setupParams);
+
+        mDecodingLayer->setup(batchSize, beamWidth, nullptr, beamSearchParams);
     }
     else if (mDecodingMode.isMedusa())
     {
-        TLLM_CHECK_WITH_INFO(beamWidth == 1, "Decoding mode is Medusa, but beamWidth != 1 (%d != 1)", beamWidth);
-        mDecodingLayer->setup(batchSize, beamWidth, batchSlots, setupParams->decodingParams);
+        auto medusaSetupParams = std::make_shared<MedusaSetupParams>();
+        medusaSetupParams->runtimeTopK = setupParams->samplingParams.runtime_top_k;
+        medusaSetupParams->runtimeHeadsTopK = setupParams->medusaParams.topKMedusaHeads;
+        medusaSetupParams->randomSeed = setupParams->randomSeed;
+        mDecodingLayer->setup(batchSize, beamWidth, batchSlots, medusaSetupParams);
     }
     else if (mDecodingMode.isLookahead())
     {
-        TLLM_CHECK_WITH_INFO(beamWidth == 1, "Decoding mode is Lookahead, but beamWidth != 1 (%d != 1)", beamWidth);
         // TODO(nkorobov) add lookahead layer
     }
     else if (mDecodingMode.isExplicitDraftTokens())
     {
-        TLLM_CHECK_WITH_INFO(
-            beamWidth == 1, "Decoding mode is ExplicitDraftTokens, but beamWidth != 1 (%d != 1)", beamWidth);
-        mDecodingLayer->setup(batchSize, beamWidth, batchSlots, setupParams->decodingParams);
+        // TODO(nkorobov) add explicit draft tokens layer setup
+        // Simply forward setup params for now.
+        mDecodingLayer->setup(batchSize, /* beamWidth */ 1, batchSlots, baseSetupParams);
     }
     else
     {
@@ -153,7 +177,7 @@ void DecodingLayer<T>::setup(SizeType32 batchSize, SizeType32 beamWidth, SizeTyp
 
 template <typename T>
 void DecodingLayer<T>::forwardAsync(
-    std::shared_ptr<BaseDecodingOutputs> const& baseOutputs, std::shared_ptr<BaseDecodingInputs> const& baseInputs)
+    std::shared_ptr<BaseOutputParams> baseOutputs, std::shared_ptr<BaseInputParams> baseInputs)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     auto [outputParams, inputParams] = prepareParams(baseOutputs, baseInputs);
@@ -163,7 +187,7 @@ void DecodingLayer<T>::forwardAsync(
 
 template <typename T>
 void DecodingLayer<T>::forwardSync(
-    std::shared_ptr<BaseDecodingOutputs> const& baseOutputs, std::shared_ptr<BaseDecodingInputs> const& baseInputs)
+    std::shared_ptr<BaseOutputParams> baseOutputs, std::shared_ptr<BaseInputParams> baseInputs)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     auto [outputParams, inputParams] = prepareParams(baseOutputs, baseInputs);
@@ -172,30 +196,31 @@ void DecodingLayer<T>::forwardSync(
 }
 
 template <typename T>
-std::tuple<std::shared_ptr<BaseDecodingOutputs>, std::shared_ptr<BaseDecodingInputs>> DecodingLayer<T>::prepareParams(
-    std::shared_ptr<BaseDecodingOutputs> const& baseOutputs,
-    std::shared_ptr<BaseDecodingInputs> const& baseInputs) const
+std::tuple<std::shared_ptr<BaseOutputParams>, std::shared_ptr<BaseInputParams>> DecodingLayer<T>::prepareParams(
+    std::shared_ptr<BaseOutputParams> baseOutputs, std::shared_ptr<BaseInputParams> baseInputs) const
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-    auto params = std::dynamic_pointer_cast<DecodingInputs>(baseInputs);
+    auto outputs = std::dynamic_pointer_cast<DynamicDecodeOutputParams>(baseOutputs);
+    auto params = std::dynamic_pointer_cast<DynamicDecodeInputParams>(baseInputs);
 
-    auto const localDecoderDomain = getLocalDecoderDomain(params, mDecoderDomain);
-    auto const maxSeqLen = baseOutputs->outputIds.shape[baseOutputs->outputIds.shape.size() - 1];
-    auto const& endIds = params->endIds;
+    auto const localDecoderDomain = getLocalDecoderDomain(params);
+    auto const maxSeqLen = outputs->output_ids.shape[outputs->output_ids.shape.size() - 1];
+    auto const& endIds = params->end_ids;
 
-    std::shared_ptr<BaseDecodingOutputs> preparedOutputs;
-    std::shared_ptr<BaseDecodingInputs> preparedInputs;
+    std::shared_ptr<BaseOutputParams> preparedOutputs;
+    std::shared_ptr<BaseInputParams> preparedInputs;
 
+    // dynamic decode GPT
     if (mDecodingMode.isBeamSearch())
     {
         preparedInputs = baseInputs;
         preparedOutputs = baseOutputs;
     }
     else if (mDecodingMode.isTopKorTopP())
-    {
+    { // beamWidth == 1
         auto const ite = params->ite;
         auto const step = params->step;
-        auto const localBatchSize = static_cast<std::size_t>(params->localBatchSize);
+        auto const localBatchSize = static_cast<std::size_t>(params->local_batch_size);
 
         TLLM_CHECK_WITH_INFO(localDecoderDomain.getBeamWidth() == 1,
             "Decoding mode is TopK and/or TopP, but beamWidth != 1 (%d != 1)", localDecoderDomain.getBeamWidth());
@@ -205,29 +230,60 @@ std::tuple<std::shared_ptr<BaseDecodingOutputs>, std::shared_ptr<BaseDecodingInp
         Tensor const logitsSlice{params->logits->slice(
             {localBatchSize, static_cast<size_t>(localDecoderDomain.getBeamWidth()), params->logits->shape[2]}, 0)};
         Tensor const endIdSlice{endIds.slice({localBatchSize}, 0)};
-        auto decodeInputs = std::make_shared<SamplingInputs>(endIdSlice, step, ite, localBatchSize);
+        auto decodeInputs = std::make_shared<SamplingInputParams>(
+            step, ite, logitsSlice, endIdSlice, static_cast<SizeType32>(maxSeqLen));
 
         decodeInputs->finished = params->finished;
 
-        decodeInputs->logits = logitsSlice;
-
-        if (params->inputLengths)
+        if (params->input_lengths)
         {
-            auto& inputLengths = params->inputLengths.value();
-            decodeInputs->inputLengths
+            auto& inputLengths = params->input_lengths.value();
+            decodeInputs->input_lengths
                 = inputLengths.slice({localBatchSize, static_cast<size_t>(localDecoderDomain.getBeamWidth())}, 0);
         }
-        decodeInputs->batchSlots = params->batchSlots;
+        decodeInputs->batch_slots = params->batch_slots;
+
+        auto decodeOutputs = std::make_shared<SamplingOutputParams>(outputs->output_ids);
+        decodeOutputs->output_ids_ptr = std::move(outputs->output_ids_ptr);
+        if (outputs->sequence_length)
+        {
+            decodeOutputs->sequence_length
+                = outputs->sequence_length->slice({localBatchSize * localDecoderDomain.getBeamWidth()}, 0);
+        }
+        if (outputs->finished)
+        {
+            decodeOutputs->finished = outputs->finished->slice({localBatchSize * localDecoderDomain.getBeamWidth()}, 0);
+        }
+        if (outputs->cum_log_probs)
+        {
+            decodeOutputs->cum_log_probs
+                = outputs->cum_log_probs->slice({localBatchSize * localDecoderDomain.getBeamWidth()}, 0);
+        }
+        if (outputs->output_log_probs_tiled)
+        {
+            Tensor& output_log_probs = outputs->output_log_probs_tiled.value();
+            decodeOutputs->output_log_probs
+                = output_log_probs.slice({1, localBatchSize * localDecoderDomain.getBeamWidth()}, 0);
+        }
 
         preparedInputs = decodeInputs;
-        preparedOutputs = baseOutputs;
+        preparedOutputs = decodeOutputs;
     }
     else if (mDecodingMode.isMedusa())
     {
         TLLM_CHECK_WITH_INFO(localDecoderDomain.getBeamWidth() == 1,
             "Decoding mode is Medusa, but beamWidth != 1 (%d != 1)", localDecoderDomain.getBeamWidth());
 
-        preparedInputs = baseInputs;
+        auto medusaInputParams = std::make_shared<MedusaInputParams>(params->logits.value(), endIds);
+        medusaInputParams->finished = outputs->finished.value();
+        medusaInputParams->batch_slots = params->batch_slots;
+        medusaInputParams->paths = params->medusaInputs->medusaPaths;
+        medusaInputParams->medusaLogits = params->medusaInputs->medusaLogits;
+        medusaInputParams->medusaCurTokensPerStep = params->medusaInputs->medusaCurTokensPerStep;
+        medusaInputParams->medusaTargetTokensPerStep = params->medusaInputs->medusaTargetTokensPerStep;
+        medusaInputParams->treeIds = params->medusaInputs->medusaTreeIds;
+
+        preparedInputs = medusaInputParams;
         preparedOutputs = baseOutputs;
     }
     else if (mDecodingMode.isLookahead())
@@ -254,4 +310,5 @@ std::tuple<std::shared_ptr<BaseDecodingOutputs>, std::shared_ptr<BaseDecodingInp
 template class DecodingLayer<float>;
 template class DecodingLayer<half>;
 
-} // namespace tensorrt_llm::layers
+} // namespace layers
+} // namespace tensorrt_llm

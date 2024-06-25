@@ -239,7 +239,6 @@ void testGptSession(fs::path const& modelPath, ModelSpec const& modelSpec, Model
     samplingConfig.topP = std::vector{0.0f};
     samplingConfig.lengthPenalty = std::vector{1.0f};
     samplingConfig.earlyStopping = std::vector{1};
-    samplingConfig.noRepeatNgramSize = std::vector{1 << 30};
 
     auto const padId = modelIds.padId;
     auto endId = modelIds.endId;
@@ -705,7 +704,7 @@ INSTANTIATE_TEST_SUITE_P(LlamaSessionTest, ParamTest,
 
 INSTANTIATE_TEST_SUITE_P(ChatGlmSessionTest, ParamTest,
     testing::Combine(testing::Values(ModelParams{CHATGLM_MODEL_DIR, {130005, 3}}), // end_id, pad_id
-        testing::Values(ModelSpec{FP16_GPT_ATTENTION_DIR, FP16_PLUGIN_RESULT_FILE, nvinfer1::DataType::kHALF}
+        testing::Values(ModelSpec{FP32_GPT_ATTENTION_DIR, FP32_PLUGIN_RESULT_FILE, nvinfer1::DataType::kFLOAT}
                             .useGptAttentionPlugin()
 
                 ),
@@ -718,7 +717,7 @@ INSTANTIATE_TEST_SUITE_P(ChatGlmSessionTest, ParamTest,
 
 INSTANTIATE_TEST_SUITE_P(ChatGlm2SessionTest, ParamTest,
     testing::Combine(testing::Values(ModelParams{CHATGLM2_MODEL_DIR, {2, 0}}), // end_id, pad_id
-        testing::Values(ModelSpec{FP16_GPT_ATTENTION_DIR, FP16_PLUGIN_RESULT_FILE, nvinfer1::DataType::kHALF}
+        testing::Values(ModelSpec{FP32_GPT_ATTENTION_DIR, FP32_PLUGIN_RESULT_FILE, nvinfer1::DataType::kFLOAT}
                             .useGptAttentionPlugin()
 
                 ),
@@ -731,7 +730,7 @@ INSTANTIATE_TEST_SUITE_P(ChatGlm2SessionTest, ParamTest,
 
 INSTANTIATE_TEST_SUITE_P(ChatGlm3SessionTest, ParamTest,
     testing::Combine(testing::Values(ModelParams{CHATGLM3_MODEL_DIR, {2, 0}}), // end_id, pad_id
-        testing::Values(ModelSpec{FP16_GPT_ATTENTION_DIR, FP16_PLUGIN_RESULT_FILE, nvinfer1::DataType::kHALF}
+        testing::Values(ModelSpec{FP32_GPT_ATTENTION_DIR, FP32_PLUGIN_RESULT_FILE, nvinfer1::DataType::kFLOAT}
                             .useGptAttentionPlugin()
 
                 ),

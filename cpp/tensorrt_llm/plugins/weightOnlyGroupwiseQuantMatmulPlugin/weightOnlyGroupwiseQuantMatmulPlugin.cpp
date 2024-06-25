@@ -16,8 +16,6 @@
  */
 #include "weightOnlyGroupwiseQuantMatmulPlugin.h"
 
-#include <numeric>
-
 using namespace nvinfer1;
 using namespace tensorrt_llm::common;
 using namespace tensorrt_llm::kernels::cutlass_kernels;

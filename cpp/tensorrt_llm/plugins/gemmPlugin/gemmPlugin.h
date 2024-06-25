@@ -79,7 +79,7 @@ public:
 
     GemmPlugin() = delete;
 
-    GemmPlugin(int transA, int transB, int padLda, int padLdb, nvinfer1::DataType type, bool useFp8, float alpha,
+    GemmPlugin(int transA, int transB, int padLda, int padLdb, nvinfer1::DataType type, bool useFp8,
         PluginProfilerPtr const& profiler);
 
     GemmPlugin(void const* data, size_t length, PluginProfilerPtr const& profiler);
@@ -135,7 +135,6 @@ private:
     GemmDims mDims{};
     GemmIdCublas mGemmId{};
     bool mUseFp8{false};
-    float mAlpha{1.f};
 
     PluginProfilerPtr mPluginProfiler;
 };

@@ -17,10 +17,16 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/memoryUtils.h"
+#include "tensorrt_llm/common/tensor.h"
+#include "tensorrt_llm/kernels/decodingCommon.h"
 #include "tensorrt_llm/layers/baseLayer.h"
+#include "tensorrt_llm/layers/samplingParams.h"
 #include "tensorrt_llm/runtime/common.h"
 
-namespace tensorrt_llm::layers
+namespace tensorrt_llm
+{
+namespace layers
 {
 
 //! \brief Layer to randomly sample tokens from TopK logits.
@@ -37,9 +43,8 @@ public:
     ~TopKSamplingLayer();
 
     void setup(runtime::SizeType32 batchSize, runtime::SizeType32 beamWidth, runtime::SizeType32 const* batchSlots,
-        std::shared_ptr<BaseSetupParams> const& setupParams) override;
-    void forwardAsync(std::shared_ptr<BaseDecodingOutputs> const& outputs,
-        std::shared_ptr<BaseDecodingInputs> const& inputs) override;
+        std::shared_ptr<BaseSetupParams> setupParams) override;
+    void forwardAsync(std::shared_ptr<BaseOutputParams> outputs, std::shared_ptr<BaseInputParams> inputs) override;
 
     bool const* getSkipDecodeHost() const
     {
@@ -67,4 +72,5 @@ private:
     void freeBuffer();
 };
 
-} // namespace tensorrt_llm::layers
+} // namespace layers
+} // namespace tensorrt_llm

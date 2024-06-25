@@ -65,7 +65,6 @@ private:
     const std::string mLayerName;
     std::set<int> mGroup;
     nvinfer1::DataType mType;
-    std::shared_ptr<ncclComm_t> mNcclComm;
 };
 
 class AllgatherPluginCreator : public BaseCreator

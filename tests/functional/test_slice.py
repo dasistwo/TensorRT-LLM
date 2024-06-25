@@ -24,12 +24,14 @@ import os
 import sys
 
 from parameterized import parameterized
+from polygraphy.backend.trt import (CreateConfig, EngineFromNetwork, Profile,
+                                    TrtRunner)
 
 import tensorrt_llm
 from tensorrt_llm import Tensor
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-from utils.util import create_session, run_session, unittest_name_func
+from utils.util import unittest_name_func
 
 
 class TestFunctional(unittest.TestCase):
@@ -39,20 +41,19 @@ class TestFunctional(unittest.TestCase):
 
     @parameterized.expand([('float32', ), ('float16', )],
                           name_func=unittest_name_func)
-    def test_slice_explicit(self, dtype):
+    def test_slice_1(self, dtype):
         # test data
         x_shape = (1, 256)
         x_data = torch.rand(x_shape,
-                            dtype=tensorrt_llm._utils.str_dtype_to_torch(dtype),
-                            device="cuda")
+                            dtype=tensorrt_llm._utils.str_dtype_to_torch(dtype))
         starts_data = torch.tensor([0, 128]).int()
         sizes_data = torch.tensor([1, 1]).int()
 
         # construct trt network
         builder = tensorrt_llm.Builder()
-        network = builder.create_network()
-        with tensorrt_llm.net_guard(network):
-
+        net = builder.create_network()
+        with tensorrt_llm.net_guard(net):
+            network = tensorrt_llm.default_trtnet()
             x = Tensor(name='x',
                        shape=x_shape,
                        dtype=tensorrt_llm.str_dtype_to_trt(dtype))
@@ -60,40 +61,43 @@ class TestFunctional(unittest.TestCase):
 
             sizes = Tensor(name='sizes', shape=(2, ), dtype=trt.int32)
 
-            output = tensorrt_llm.functional.slice(x, starts, sizes)
-            output.mark_output('output')
-
-        profile = builder.trt_builder.create_optimization_profile()
-        profile.set_shape_input('starts', (0, 128), (0, 128), (0, 128))
-        profile.set_shape_input('sizes', (1, 1), (1, 1), (1, 1))
+            output = tensorrt_llm.functional.slice(x, starts, sizes).trt_tensor
+            output.name = 'output'
+            network.mark_output(output)
 
         # trt run
-        session = create_session(builder,
-                                 network,
-                                 precision=dtype,
-                                 optimization_profiles=[profile])
-        inputs = {'x': x_data, 'starts': starts_data, 'sizes': sizes_data}
-        outputs = run_session(session, inputs)
+        profiles = [
+            Profile().add('starts', (0, 0), (0, 128),
+                          (0, 256)).add('sizes', (1, 1), (1, 1), (1, 256))
+        ]
+        build_engine = EngineFromNetwork((builder.trt_builder, net.trt_network),
+                                         config=CreateConfig(profiles=profiles))
+        with TrtRunner(build_engine) as runner:
+            outputs = runner.infer(
+                feed_dict={
+                    'x': x_data.numpy(),
+                    'starts': starts_data.numpy(),
+                    'sizes': sizes_data.numpy(),
+                })
 
         # pytorch run
         ref = x_data[0:1, 128:129]
 
         # compare diff
-        torch.testing.assert_close(ref, outputs['output'])
+        np.testing.assert_allclose(ref.cpu().numpy(), outputs['output'])
 
-    def test_slice_implicit(self):
+    def test_slice_2(self):
         dtype = 'float32'
         x_shape = (256, )
         slice_length = 128
         x_data = torch.rand(x_shape,
-                            dtype=tensorrt_llm._utils.str_dtype_to_torch(dtype),
-                            device="cuda")
+                            dtype=tensorrt_llm._utils.str_dtype_to_torch(dtype))
 
         # construct trt network
         builder = tensorrt_llm.Builder()
-        network = builder.create_network()
-        with tensorrt_llm.net_guard(network):
-
+        net = builder.create_network()
+        with tensorrt_llm.net_guard(net):
+            network = tensorrt_llm.default_trtnet()
             x = Tensor(name='x',
                        shape=x_shape,
                        dtype=tensorrt_llm.str_dtype_to_trt(dtype))
@@ -103,19 +107,17 @@ class TestFunctional(unittest.TestCase):
                 np.array([0] * slice_length, dtype=np.int32))
             sizes = tensorrt_llm.functional.shape(output_length, 0)
 
-            output = tensorrt_llm.functional.slice(x, starts, sizes.view([1]))
-
-            output.mark_output('output')
+            output = tensorrt_llm.functional.slice(x, starts,
+                                                   sizes.view([1])).trt_tensor
+            output.name = 'output'
+            network.mark_output(output)
 
         # trt run
-        session = create_session(builder, network, precision=dtype)
-        inputs = {
-            'x': x_data,
-        }
-        outputs = run_session(session, inputs)
+        build_engine = EngineFromNetwork((builder.trt_builder, net.trt_network))
+        with TrtRunner(build_engine) as runner:
+            outputs = runner.infer(feed_dict={'x': x_data.numpy()})
 
-        # pytorch run
         ref = x_data[0:slice_length]
-
-        # compare diff
-        torch.testing.assert_close(ref, outputs['output'])
+        np.testing.assert_allclose(ref.cpu().numpy(),
+                                   outputs['output'],
+                                   atol=1e-5)

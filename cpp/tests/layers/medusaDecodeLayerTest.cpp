@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,12 +16,20 @@
 
 #include "tests/layers/medusaDecodeLayerTest.h"
 #include "tensorrt_llm/kernels/decodingCommon.h"
-#include "tensorrt_llm/runtime/medusaModule.h"
 #include "tensorrt_llm/runtime/runtimeKernels.h"
 #include <algorithm>
 
 namespace tensorrt_llm::tests::layers
 {
+
+// TODO(nkorobov):
+// Add tests for
+// - finished states
+// - finished sum
+// - max length
+// - repeat n grams
+// - padded vocab
+// - beam search
 
 using namespace tensorrt_llm::runtime;
 using namespace tensorrt_llm::layers;
@@ -45,9 +53,8 @@ void MedusaDecodingLayerTest<T>::SetUp()
 template <typename T>
 void MedusaDecodingLayerTest<T>::allocateBuffers()
 {
-    auto speculativeDecodingModule = std::make_shared<MedusaModule>(mMaxDraftPathLen, mMaxDecodingTokens - 1);
     auto const decodingDomain = tensorrt_llm::layers::DecoderDomain(
-        mMaxBatchSize, 1, mVocabSize, mVocabSizePadded, speculativeDecodingModule);
+        mMaxBatchSize, 1, mVocabSize, mVocabSizePadded, mMaxTokensPerStep, mMaxNumHeads);
     mMedusaDecodingLayer
         = std::make_shared<tensorrt_llm::layers::MedusaDecodingLayer<T>>(decodingDomain, mStream->get(), mAllocator);
 
@@ -130,13 +137,13 @@ void MedusaDecodingLayerTest<T>::allocateBuffers()
     // clang-format on
 
     auto const targetLogitsHost
-        = ITensor::wrap(targetLogitsInit.data(), dataType, ITensor::makeShape({mMaxDecodingTokens, mVocabSizePadded}));
+        = ITensor::wrap(targetLogitsInit.data(), dataType, ITensor::makeShape({mMaxTokensPerStep, mVocabSizePadded}));
 
-    TensorPtr medusaLogitsHost = ITensor::wrap(medusaLogitsInit.data(), dataType,
-        ITensor::makeShape({mMaxDraftPathLen, mMaxDecodingTokens, mVocabSizePadded}));
+    TensorPtr medusaLogitsHost = ITensor::wrap(
+        medusaLogitsInit.data(), dataType, ITensor::makeShape({mMaxNumHeads, mMaxTokensPerStep, mVocabSizePadded}));
 
     mTargetLogitsDevice
-        = mBufferManager->gpu(ITensor::makeShape({mBatchSize, mMaxDecodingTokens, mVocabSizePadded}), dataType);
+        = mBufferManager->gpu(ITensor::makeShape({mBatchSize, mMaxTokensPerStep, mVocabSizePadded}), dataType);
 
     mFinishedDevice = mBufferManager->gpu(
         ITensor::makeShape({mMaxBatchSize}), TRTDataType<tk::FinishedState::UnderlyingType>::value);
@@ -148,20 +155,20 @@ void MedusaDecodingLayerTest<T>::allocateBuffers()
     mEndIdsDevice = mBufferManager->gpu(ITensor::makeShape({mMaxBatchSize}), nvinfer1::DataType::kINT32);
 
     mPathsDevice = mBufferManager->gpu(
-        ITensor::makeShape({mMaxBatchSize, mMaxDecodingTokens, mMaxDraftPathLen + 1}), nvinfer1::DataType::kINT32);
+        ITensor::makeShape({mMaxBatchSize, mMaxTokensPerStep, mMaxNumHeads + 1}), nvinfer1::DataType::kINT32);
 
     mSeqLengthsDevice = mBufferManager->gpu(ITensor::makeShape({mMaxBatchSize}), nvinfer1::DataType::kINT32);
 
     mAcceptedLengths = mBufferManager->gpu(ITensor::makeShape({mMaxBatchSize}), nvinfer1::DataType::kINT32);
 
     mTreeIdsDevice
-        = mBufferManager->gpu(ITensor::makeShape({mMaxBatchSize, mMaxDecodingTokens - 1}), nvinfer1::DataType::kINT32);
+        = mBufferManager->gpu(ITensor::makeShape({mMaxBatchSize, mMaxTokensPerStep - 1}), nvinfer1::DataType::kINT32);
 
     mMedusaLogitsDevice = mBufferManager->gpu(
-        ITensor::makeShape({mMaxDraftPathLen, mMaxBatchSize, mMaxDecodingTokens, mVocabSizePadded}), dataType);
+        ITensor::makeShape({mMaxNumHeads, mMaxBatchSize, mMaxTokensPerStep, mVocabSizePadded}), dataType);
 
     mNextDraftTokensDevice
-        = mBufferManager->gpu(ITensor::makeShape({mMaxBatchSize, mMaxDecodingTokens - 1}), nvinfer1::DataType::kINT32);
+        = mBufferManager->gpu(ITensor::makeShape({mMaxBatchSize, mMaxTokensPerStep - 1}), nvinfer1::DataType::kINT32);
 
     mTokensPerStepDevice = mBufferManager->gpu(ITensor::makeShape({mMaxBatchSize}), nvinfer1::DataType::kINT32);
 
@@ -169,7 +176,7 @@ void MedusaDecodingLayerTest<T>::allocateBuffers()
         = mBufferManager->gpu(ITensor::makeShape({mMaxBatchSize + 1}), nvinfer1::DataType::kINT32);
 
     mPackedPathsDevice
-        = mBufferManager->gpu(ITensor::makeShape({mMaxBatchSize * mMaxDraftPathLen}), nvinfer1::DataType::kINT32);
+        = mBufferManager->gpu(ITensor::makeShape({mMaxBatchSize * mMaxNumHeads}), nvinfer1::DataType::kINT32);
 
     for (int32_t bi = 0; bi < mBatchSize; ++bi)
     {
@@ -177,7 +184,7 @@ void MedusaDecodingLayerTest<T>::allocateBuffers()
         mBufferManager->copy(*targetLogitsHost, *logitsDeviceView);
     }
 
-    for (int32_t hi = 0; hi < mMaxDraftPathLen; ++hi)
+    for (int32_t hi = 0; hi < mMaxNumHeads; ++hi)
     {
         TensorPtr logitsHeadDeviceView = ITensor::slice(mMedusaLogitsDevice, hi, 1);
         TensorPtr logitsHeadHostView = ITensor::slice(medusaLogitsHost, hi, 1);
@@ -215,7 +222,7 @@ void MedusaDecodingLayerTest<T>::setup(SamplingParams& params)
     for (SizeType32 bi = 0; bi < mBatchSize; ++bi)
     {
         auto const draftIdsHost = ITensor::wrap(reinterpret_cast<TokenIdType*>(params.draftIds[bi].data()),
-            nvinfer1::DataType::kINT32, ITensor::makeShape({1, mMaxDecodingTokens - 1}));
+            nvinfer1::DataType::kINT32, ITensor::makeShape({1, mMaxTokensPerStep - 1}));
         auto draftIdsDeviceSlice = ITensor::slice(mNextDraftTokensDevice, batchSlotsPtr[bi], 1);
         mBufferManager->copy(*draftIdsHost, *draftIdsDeviceSlice);
     }
@@ -223,9 +230,9 @@ void MedusaDecodingLayerTest<T>::setup(SamplingParams& params)
     for (SizeType32 bi = 0; bi < mBatchSize; ++bi)
     {
         auto& path = params.paths[bi];
-        auto const numPaths = static_cast<SizeType32>(params.paths[bi].size() / (mMaxDraftPathLen + 1));
+        auto const numPaths = static_cast<SizeType32>(params.paths[bi].size() / (mMaxNumHeads + 1));
         auto const pathsHost = ITensor::wrap(reinterpret_cast<SizeType32*>(path.data()), nvinfer1::DataType::kINT32,
-            ITensor::makeShape({1, numPaths, mMaxDraftPathLen + 1}));
+            ITensor::makeShape({1, numPaths, mMaxNumHeads + 1}));
         TensorPtr pathsDeviceSlice = ITensor::slice(mPathsDevice, batchSlotsPtr[bi], 1);
         pathsDeviceSlice->squeeze(0);
         TensorPtr pathsNumPathsDeviceSlice = ITensor::slice(pathsDeviceSlice, 0, numPaths);
@@ -262,17 +269,16 @@ void MedusaDecodingLayerTest<T>::setup(SamplingParams& params)
 }
 
 template <typename T>
-std::shared_ptr<MedusaDecodingInputs> MedusaDecodingLayerTest<T>::createInputTensors()
+std::shared_ptr<MedusaInputParams> MedusaDecodingLayerTest<T>::createInputTensors()
 {
-    auto forwardParams = std::make_shared<MedusaDecodingInputs>(tcc::toTllmTensor(*mEndIdsDevice), mBatchSize);
+    auto forwardParams = std::make_shared<MedusaInputParams>(
+        tcc::toTllmTensor(*mTargetLogitsDevice), tcc::toTllmTensor(*mEndIdsDevice));
 
     auto batchSlots = BufferRange<SizeType32>(*mBatchSlots);
 
-    forwardParams->logits = tcc::toTllmTensor(*mTargetLogitsDevice);
-
     forwardParams->finished = tcc::toTllmTensor(*mFinishedDevice);
 
-    forwardParams->batchSlots = tcc::toTllmTensor(*mBatchSlots);
+    forwardParams->batch_slots = tcc::toTllmTensor(*mBatchSlots);
 
     forwardParams->paths = tcc::toTllmTensor(*mPathsDevice);
 
@@ -282,11 +288,11 @@ std::shared_ptr<MedusaDecodingInputs> MedusaDecodingLayerTest<T>::createInputTen
     auto const medusaLogitsPtr = bufferCast<T>(*mMedusaLogitsDevice);
     for (SizeType32 bi = 0; bi < mMaxBatchSize; ++bi)
     {
-        medusaLogits[bi].resize(mMaxDraftPathLen);
+        medusaLogits[bi].resize(mMaxNumHeads);
     }
     for (SizeType32 bi = 0; bi < mBatchSize; ++bi)
     {
-        for (SizeType32 hi = 0; hi < mMaxDraftPathLen; ++hi)
+        for (SizeType32 hi = 0; hi < mMaxNumHeads; ++hi)
         {
             TensorPtr logitsHead = ITensor::slice(mMedusaLogitsDevice, hi, 1);
             logitsHead->squeeze(0);
@@ -296,29 +302,30 @@ std::shared_ptr<MedusaDecodingInputs> MedusaDecodingLayerTest<T>::createInputTen
     }
     forwardParams->medusaLogits = medusaLogits;
 
-    forwardParams->curTokensPerStep = tcc::toTllmTensor(*mTokensPerStepDevice);
+    forwardParams->medusaCurTokensPerStep = tcc::toTllmTensor(*mTokensPerStepDevice);
 
-    forwardParams->targetTokensPerStep = tcc::toTllmTensor(*mTokensPerStepDevice);
+    forwardParams->medusaTargetTokensPerStep = tcc::toTllmTensor(*mTokensPerStepDevice);
 
     return forwardParams;
 }
 
 template <typename T>
-std::shared_ptr<SpeculativeDecodingOutputs> MedusaDecodingLayerTest<T>::createOutputTensors()
+std::shared_ptr<DynamicDecodeOutputParams> MedusaDecodingLayerTest<T>::createOutputTensors()
 {
-    auto outputParams = std::make_shared<SpeculativeDecodingOutputs>(tcc::toTllmTensor(*mOutputIdsDevice));
+    auto outputParams = std::make_shared<DynamicDecodeOutputParams>(tcc::toTllmTensor(*mOutputIdsDevice));
 
-    outputParams->sequenceLength = tcc::toTllmTensor(*mSeqLengthsDevice);
+    outputParams->sequence_length = tcc::toTllmTensor(*mSeqLengthsDevice);
 
     outputParams->finished = tcc::toTllmTensor(*mFinishedDevice);
 
-    outputParams->nextDraftTokens = tcc::toTllmTensor(*mNextDraftTokensDevice);
+    outputParams->speculativeDecodingOutputs = DynamicDecodeOutputParams::SpeculativeDecodingOutputs();
+    outputParams->speculativeDecodingOutputs->nextDraftTokens = tcc::toTllmTensor(*mNextDraftTokensDevice);
 
-    outputParams->numNewTokens = tcc::toTllmTensor(*mAcceptedLengths);
+    outputParams->speculativeDecodingOutputs->acceptedLengths = tcc::toTllmTensor(*mAcceptedLengths);
 
-    outputParams->numNewTokensCumSum = tcc::toTllmTensor(*mAcceptedLengthCumSumDevice);
+    outputParams->speculativeDecodingOutputs->acceptedLengthsCumSum = tcc::toTllmTensor(*mAcceptedLengthCumSumDevice);
 
-    outputParams->pathsOffsets = tcc::toTllmTensor(*mPackedPathsDevice);
+    outputParams->speculativeDecodingOutputs->pathsOffsets = tcc::toTllmTensor(*mPackedPathsDevice);
 
     return outputParams;
 }
@@ -373,7 +380,7 @@ void MedusaDecodingLayerTest<T>::checkResult(std::vector<std::vector<std::set<To
         auto const slot = batchSlots[bi];
         for (SizeType32 ti = 0; ti < expectedDraftTokensBatch.size(); ++ti)
         {
-            EXPECT_EQ(expectedDraftTokensBatch[ti], nextDraftTokens[slot * (mMaxDecodingTokens - 1) + ti])
+            EXPECT_EQ(expectedDraftTokensBatch[ti], nextDraftTokens[slot * (mMaxTokensPerStep - 1) + ti])
                 << "bi " << bi << " ti " << ti;
         }
     }

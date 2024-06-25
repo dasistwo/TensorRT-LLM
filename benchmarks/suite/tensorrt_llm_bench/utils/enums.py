@@ -51,7 +51,9 @@ class KVCacheDtypeEnum(MultiValueEnum):
             List[str]: A list of command line arguments to be added to build
             commands.
         """
-        if not self.value == self.FP8:
+        if self.value == self.FP8:
+            return ["--strongly_typed"]
+        else:
             return ["--gemm_plugin", dtype]
 
 

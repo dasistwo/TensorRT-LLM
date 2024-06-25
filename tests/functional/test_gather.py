@@ -12,34 +12,30 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import os
-import sys
 import unittest
 
+import numpy as np
 import torch
+from polygraphy.backend.trt import EngineFromNetwork, TrtRunner
 
 import tensorrt_llm
 from tensorrt_llm import Tensor
 
-sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-from utils.util import create_session, run_session
 
-
-class TestGather(unittest.TestCase):
+class TestFunctional(unittest.TestCase):
 
     def setUp(self):
         tensorrt_llm.logger.set_level('error')
 
     def test_gather(self):
         dtype = 'float32'
-        x_data = torch.randn(2, 128, 768, device="cuda")
-        y_data = torch.tensor([101, 127], device="cuda").int()
+        x_data = torch.randn(2, 128, 768)
+        y_data = torch.tensor([101, 127]).int()
 
-        # construct trt network
         builder = tensorrt_llm.Builder()
-        network = builder.create_network()
-        with tensorrt_llm.net_guard(network):
-
+        net = builder.create_network()
+        with tensorrt_llm.net_guard(net):
+            network = tensorrt_llm.default_trtnet()
             x = Tensor(name='x',
                        shape=x_data.shape,
                        dtype=tensorrt_llm.str_dtype_to_trt(dtype))
@@ -61,19 +57,24 @@ class TestGather(unittest.TestCase):
                     tensorrt_llm.functional.shape(x, 0),
                     tensorrt_llm.functional.shape(x, 2)
                 ]))
-            output.mark_output('output', dtype)
 
-        # trt run
-        session = create_session(builder, network, precision=dtype)
-        inputs = {'x': x_data, 'y': y_data}
-        outputs = run_session(session, inputs)
+            output = output.trt_tensor
+            output.name = 'output'
+            network.mark_output(output)
 
-        # pytorch run
+        build_engine = EngineFromNetwork((builder.trt_builder, net.trt_network))
+        with TrtRunner(build_engine) as runner:
+            outputs = runner.infer(feed_dict={
+                'x': x_data.numpy(),
+                'y': y_data.numpy(),
+            })
+
         y_data = y_data.reshape(y_data.size(0), 1, 1)
         y_data = y_data.expand(y_data.size(0), 1, x_data.size(-1))
         ref = torch.gather(x_data, dim=1,
                            index=y_data.to(dtype=torch.int64)).view(
                                x_data.size(0), x_data.size(2))
 
-        # compare diff
-        torch.testing.assert_close(ref, outputs['output'])
+        np.testing.assert_allclose(ref.cpu().numpy(),
+                                   outputs['output'],
+                                   atol=1e-5)

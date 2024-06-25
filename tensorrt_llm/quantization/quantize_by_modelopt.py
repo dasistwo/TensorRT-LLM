@@ -122,7 +122,6 @@ MODEL_NAME_PATTERN_MAP = {
     "Gemma": "gemma",
     "MixtralForCausalLM": "llama",
     "ArcticForCausalLM": "llama",
-    "Phi3SmallForCausalLM": "phi",
 }
 
 
@@ -176,6 +175,7 @@ def get_model(ckpt_path, dtype="fp16", device="cuda"):
     if "vila" in ckpt_path:
         model = _get_vila_model(ckpt_path)
     else:
+        model_kwargs = {"torch_dtype": "auto"}
         model = AutoModelForCausalLM.from_pretrained(
             ckpt_path,
             device_map="auto" if device != "cpu" else "cpu",
@@ -214,17 +214,8 @@ def get_calib_dataloader(dataset_name_or_dir="cnn_dailymail",
     elif "cnn_dailymail" in dataset_name_or_dir:
         dataset = load_dataset(dataset_name_or_dir, name="3.0.0", split="train")
         dataset = dataset["article"][:calib_size]
-    elif os.path.isdir(dataset_name_or_dir):
-        print(
-            f"Recognized local dataset repo {dataset_name_or_dir} for calibration; "
-            "assuming the calibration data are in the train split and text column."
-        )
-        dataset = load_dataset(dataset_name_or_dir, split="train")
-        dataset = dataset["text"][:calib_size]
     else:
-        raise NotImplementedError(
-            f"Unsupported dataset name or local repo directory: {dataset_name_or_dir}."
-        )
+        raise NotImplementedError
 
     batch_encoded = tokenizer.batch_encode_plus(dataset,
                                                 return_tensors="pt",
@@ -263,7 +254,7 @@ def quantize_model(model, quant_cfg, calib_dataloader=None):
     return model
 
 
-def quantize_and_export(*, model_dir, device, calib_dataset, dtype, qformat,
+def quantize_and_export(*, model_dir, calib_dataset, dtype, qformat,
                         kv_cache_dtype, calib_size, batch_size,
                         calib_max_seq_length, awq_block_size, output_dir,
                         tp_size, pp_size, seed, tokenizer_max_seq_length):
@@ -287,7 +278,7 @@ def quantize_and_export(*, model_dir, device, calib_dataset, dtype, qformat,
     random.seed(seed)
     np.random.seed(seed)
 
-    model = get_model(model_dir, dtype, device=device)
+    model = get_model(model_dir, dtype)
     model_type = get_model_type(model)
     if "vila" in model_dir:
         tokenizer = get_tokenizer(model_dir + "/llm",
@@ -374,12 +365,18 @@ def quantize_and_export(*, model_dir, device, calib_dataset, dtype, qformat,
             else:
                 tensorrt_llm_config["quantization"]["quant_algo"] = None
 
-        # HF uses rope_scaling while tensorrt_llm uses rotary_scaling
-        if hasattr(
-                model.config,
-                "rope_scaling") and "rotary_scaling" not in tensorrt_llm_config:
-            tensorrt_llm_config["rotary_scaling"] = getattr(
-                model.config, "rope_scaling")
+        # Workaround for MOE router quantization
+        if "moe_num_experts" in tensorrt_llm_config and qformat != "full_prec":
+            if "exclude_modules" not in tensorrt_llm_config["quantization"]:
+                # Append router and lm_head because we need both excluded
+                tensorrt_llm_config["quantization"]["exclude_modules"] = [
+                    'lm_head', 'router', 'vocab_embedding',
+                    'position_embedding', 'block_embedding'
+                ]
+            else:
+                tensorrt_llm_config["quantization"]["exclude_modules"].append(
+                    "router")
+
         with open(f"{export_path}/config.json", "w") as f:
             json.dump(tensorrt_llm_config, f, indent=4)
 
@@ -411,27 +408,8 @@ def quantize_and_export(*, model_dir, device, calib_dataset, dtype, qformat,
             qwen_config = AutoConfig.from_pretrained(model_dir,
                                                      trust_remote_code=True)
             tensorrt_llm_config["qwen_type"] = qwen_config.model_type
-            if qwen_config.model_type == "qwen2":
-                tensorrt_llm_config["norm_epsilon"] = qwen_config.rms_norm_eps
-                tensorrt_llm_config["rotary_base"] = qwen_config.rope_theta
             tensorrt_llm_config[
                 "intermediate_size"] = qwen_config.intermediate_size
-            with open(f"{export_path}/config.json", "w") as f:
-                json.dump(tensorrt_llm_config, f, indent=4)
-
-        if model_type == 'phi':
-            with open(f"{export_path}/config.json", "r") as f:
-                tensorrt_llm_config = json.load(f)
-            phi_config = AutoConfig.from_pretrained(model_dir,
-                                                    trust_remote_code=True)
-
-            from ..models.phi3.phi3small.convert import \
-                convert_hf_config as phi_config_converter
-            phi_config = phi_config_converter(phi_config, dtype, None)
-
-            for key, value in phi_config.items():
-                tensorrt_llm_config[key] = value
-
             with open(f"{export_path}/config.json", "w") as f:
                 json.dump(tensorrt_llm_config, f, indent=4)
 
@@ -556,17 +534,6 @@ def get_nemo_calib_dataloader(dataset_name_or_dir="cnn_dailymail",
     elif "cnn_dailymail" in dataset_name_or_dir:
         dataset = load_dataset(dataset_name_or_dir, name="3.0.0", split="train")
         text_column = "article"
-    elif os.path.isdir(dataset_name_or_dir):
-        print(
-            f"Recognized local dataset repo {dataset_name_or_dir} for calibration; "
-            "assuming the calibration data are in the train split and text column."
-        )
-        dataset = load_dataset(dataset_name_or_dir, split="train")
-        text_column = "text"
-    else:
-        raise NotImplementedError(
-            f"Unsupported dataset name or local repo directory: {dataset_name_or_dir}."
-        )
     calib_size = max(min(len(dataset), calib_size), batch_size)
     for i in range(calib_size // batch_size):
         batch = dataset[i * batch_size:(i + 1) * batch_size][text_column]

@@ -19,7 +19,6 @@ set(SRCS
     utils/sessionUtils.cpp
     utils/debugUtils.cu
     bufferManager.cpp
-    explicitDraftTokensBuffers.cpp
     layerProfiler.cpp
     loraManager.cpp
     loraUtils.cpp

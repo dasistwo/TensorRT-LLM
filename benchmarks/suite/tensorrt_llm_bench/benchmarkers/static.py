@@ -84,8 +84,8 @@ class gptSessionBenchmarker:
             max_batch_size,
             "--max_input_len",
             max_isl,
-            "--max_seq_len",
-            max_osl + max_isl,
+            "--max_output_len",
+            max_osl,
             "--context_fmha",
             "enable",
             # Set the attention plugin data type.

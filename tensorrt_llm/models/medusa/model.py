@@ -21,7 +21,6 @@ from ...functional import ACT2FN, stack
 from ...layers import ColumnLinear
 from ...mapping import Mapping
 from ...module import Module, ModuleList
-from .config import MedusaConfig
 
 
 class MedusaLayer(Module):
@@ -81,9 +80,8 @@ class MedusaHead(Module):
 
 
 class MedusaForCausalLm(LLaMAForCausalLM):
-    config_class = MedusaConfig
 
-    def __init__(self, config: MedusaConfig):
+    def __init__(self, config):
 
         super().__init__(config)
         self.num_medusa_heads = config.num_medusa_heads

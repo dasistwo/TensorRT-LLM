@@ -16,6 +16,7 @@ from tensorrt_llm._common import _is_building
 from tensorrt_llm._utils import np_dtype_to_trt
 from tensorrt_llm.builder import EngineConfig, optimize_model_with_config
 from tensorrt_llm.models import MODEL_MAP
+from tensorrt_llm.models.modeling_utils import load_model
 
 from ..logger import logger
 
@@ -43,13 +44,7 @@ def refit_engine(engine_path: str, refit_engine_dir: str, checkpoint_dir: str,
     tik = time.time()
     rank_config = copy.deepcopy(engine_config.pretrained_config)
     rank_config.set_rank(rank)
-
-    architecture = rank_config.architecture
-    assert architecture in MODEL_MAP, \
-        f"Unsupported model architecture: {architecture}"
-    model_cls = MODEL_MAP[architecture]
-    model = model_cls.from_checkpoint(checkpoint_dir, config=rank_config)
-
+    model = load_model(rank_config, checkpoint_dir)
     tok = time.time()
     t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))
     logger.info(f'Load checkpoint(s) time: {t}')

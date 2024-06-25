@@ -38,22 +38,13 @@ public:
     using TensorPtr = ITensor::SharedPtr;
     using SharedConstPtr = ITensor::SharedConstPtr;
 
-    enum class ForwardType
-    {
-        kASYNC,
-        kSYNC
-    };
-
-    GptDecoderBatch(std::size_t vocabSize, std::size_t vocabSizePadded, CudaStreamPtr stream,
-        SpeculativeDecodingMode const& speculativeDecodingMode);
+    GptDecoderBatch(std::size_t vocabSize, std::size_t vocabSizePadded, CudaStreamPtr stream);
 
     //! Setup the decoder before calling `forward()`
     void setup(executor::DecodingMode const& mode, SizeType32 maxBatchSize, SizeType32 maxBeamWidth,
         SizeType32 maxAttentionWindow, SizeType32 sinkTokenLength, SizeType32 maxSequenceLength,
         SizeType32 maxTokensPerStep, bool fusedDecoder, nvinfer1::DataType dtype,
         ModelConfig const& modelConfig) override;
-
-    void setupExplicitDraftTokens(ExplicitDraftTokensBuffers::Inputs explicitDraftTokensBuffers) override;
 
     void newBatch(
         GenerationInput const& inputs, GenerationOutput const& outputs, SamplingConfig const& samplingConfig) override;
@@ -172,26 +163,14 @@ public:
         return mJointDecodingOutput->speculativeDecodingOutputs->nextDraftTokens;
     }
 
-    //! @returns [batchSize], predicted draft tokens lengths for previous step, on gpu
-    [[nodiscard]] TensorPtr getPrevDraftTokensLengths() const override
-    {
-        return mJointDecodingOutput->speculativeDecodingOutputs->prevDraftTokensLen;
-    }
-
-    //! @returns [batchSize], predicted draft tokens lengths for next step, on gpu
-    [[nodiscard]] TensorPtr getNextDraftTokensLengths() const override
-    {
-        return mJointDecodingOutput->speculativeDecodingOutputs->nextDraftTokensLen;
-    }
-
     //! @returns [batchSize + 1], exclusive sum of accepted draft token lengths, on gpu
-    [[nodiscard]] TensorPtr getAcceptedLengthsCumSum() const override
+    [[nodiscard]] TensorPtr getSpecDecodingAcceptedLengthsCumSum() const override
     {
         return mJointDecodingOutput->speculativeDecodingOutputs->acceptedLengthsCumSum;
     }
 
     //! @returns [batchSize, maxAcceptedDraftTokensPerStep], accepted paths packed into continuous tensor, on gpu
-    [[nodiscard]] TensorPtr getAcceptedPackedPaths() const override
+    [[nodiscard]] TensorPtr getSpecDecodingAcceptedPackedPaths() const override
     {
         return mJointDecodingOutput->speculativeDecodingOutputs->pathsOffsets;
     }
@@ -203,11 +182,11 @@ private:
     //! @brief Initialize the decoder at `batchIdx` with a new `request`.
     void newRequest(SizeType32 batchIdx, decoder_batch::Request const& request, SamplingConfig const& samplingConfig);
 
-    //! @brief Allocate buffers for speculative decoding.
-    void allocateSpeculativeDecodingBuffers();
+    //! @brief Allocate buffers for medusa decoding.
+    void allocateMedusaBuffers();
 
-    //! @brief Setup buffers for speculative decoding.
-    void setupSpeculativeDecoding(ModelConfig const& modelConfig);
+    //! @brief Setup buffers for medusa decoding.
+    void setupMedusa(ModelConfig const& modelConfig);
 
     //! @brief Setups decoder internal tensors for new speculative decoding request
     void newRequestSpeculativeDecoding(
@@ -223,25 +202,20 @@ private:
     //! @brief Setups decoder internal tensors for new Lookahead request
     void newRequestLookahead(SizeType32 batchIdx, decoder_batch::Request const& request);
 
-    //! @brief Setups decoder internal tensors for new Explicit draft tokens request
-    void newRequestExplicitDraftTokens(SizeType32 batchIdx, decoder_batch::Request const& request);
-
     //! @brief Updates finished state on host for all active requests
     void updateFinished(decoder_batch::Token const& token);
 
-    //! @brief Sets inputs for explicit draft tokens.
-    void setExplicitDraftTokensInputs(decoder_batch::Input const& input);
-
     //! @brief Calls unfused or fused decoders for tokens per engine step
-    void forwardDispatch(decoder_batch::Output& output, decoder_batch::Input const& input, ForwardType forwardType);
+    void forwardDispatch(
+        decoder_batch::Output& output, decoder_batch::Input const& input, std::optional<CudaEvent> const& eventStart);
 
     //! @brief Calls unfused decoder for whole batch in loop
-    void forwardUnfusedDecoder(
-        SizeType32 step, decoder_batch::Output& output, decoder_batch::Input const& input, ForwardType forwardType);
+    void forwardUnfusedDecoder(SizeType32 step, decoder_batch::Output& output, decoder_batch::Input const& input,
+        std::optional<CudaEvent> const& eventStart);
 
     //! @brief Calls fused decoder for whole batch
-    void forwardFusedDecoder(
-        SizeType32 step, decoder_batch::Output& output, decoder_batch::Input const& input, ForwardType forwardType);
+    void forwardFusedDecoder(SizeType32 step, decoder_batch::Output& output, decoder_batch::Input const& input,
+        std::optional<CudaEvent> const& eventStart);
 
 private:
     std::size_t const mVocabSize;
@@ -271,7 +245,7 @@ private:
     TensorPtr mFinishedSum;
     std::vector<SizeType32> mMaxNewTokens;
     std::vector<SizeType32> mBeamWidths;
-    std::vector<SizeType32> mNumDecodingEngineTokens;
+    std::vector<SizeType32> mGeneratedTokensPerEngineStep;
 
     TensorPtr mFinishedSteps;   // [maxTokensPerStep, batchSize, beamWidth] finished states of type FinishedState
                                 // for each generated token of maxTokensPerStep, on gpu
@@ -291,15 +265,11 @@ private:
     SizeType32 mMaxAttentionWindow{};
     SizeType32 mSinkTokenLength{};
     SizeType32 mActualBatchSize{};
+    SizeType32 mMaxTokensPerEngineStep{};
     SizeType32 mMaxStopWordsLen{};
     SizeType32 mMaxBadWordsLen{};
-    // How many tokens for one request can be processed per mDecoders call.
-    // It is maxDecodingTokens for non speculative decoding and Draft model approach.
-    // Otherwise it is 1.
-    SizeType32 mMaxDecodingDecoderTokens{};
-    // How many tokens predicted by the engine for one request.
-    // It is maxDecodingTokens. >= 1 for speculative decoding and == 1 for non speculative decoding.
-    SizeType32 mMaxDecodingEngineTokens{};
+    // How many tokens for one request can be processed per mDecoders call
+    SizeType32 mMaxTokensPerDecoderStep{};
 
     bool mFusedDecoder{false};
     SpeculativeDecodingMode mSpeculativeDecodingMode;

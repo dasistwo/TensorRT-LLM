@@ -3,7 +3,8 @@ import os
 from argparse import ArgumentParser
 from typing import Literal, Optional
 
-from pydantic import AliasChoices, AliasPath, BaseModel, Field, model_validator
+from pydantic import (AliasChoices, AliasPath, BaseModel, Field, computed_field,
+                      model_validator)
 from transformers import AutoConfig
 from utils import VALID_QUANT_ALGOS
 
@@ -131,7 +132,7 @@ class TRTLLMConfig(BaseModel):
     mapping: TRTLLM_Mapping
     quantization: TRTLLM_Quantization
 
-    @property
+    @computed_field
     def kv_dtype(self) -> str:
         if self.quantization.kv_cache_quant_algo == "FP8":
             return "fp8"

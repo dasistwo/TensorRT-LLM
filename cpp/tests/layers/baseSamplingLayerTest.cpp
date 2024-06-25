@@ -93,14 +93,15 @@ void BaseSamplingLayerTest<T>::setup(uint64_t seed, TestSamplingParams const& pa
 
     auto setupParams = std::make_shared<SamplingSetupParams>();
     setupParams->randomSeed = std::make_optional<std::vector<uint64_t>>({seed});
-    setupParams->runtimeTopK
+    setupParams->runtime_top_k
         = params.topKs.size() ? std::make_optional<std::vector<SizeType32>>(params.topKs) : std::nullopt;
-    setupParams->runtimeTopP
+    setupParams->runtime_top_p
         = params.topPs.size() ? std::make_optional<std::vector<float>>(params.topPs) : std::nullopt;
-    setupParams->topPDecay = params.decay.size() ? std::make_optional<std::vector<float>>(params.decay) : std::nullopt;
-    setupParams->topPMin
+    setupParams->top_p_decay
+        = params.decay.size() ? std::make_optional<std::vector<float>>(params.decay) : std::nullopt;
+    setupParams->top_p_min
         = params.minTopP.size() ? std::make_optional<std::vector<float>>(params.minTopP) : std::nullopt;
-    setupParams->topPResetIds
+    setupParams->top_p_reset_ids
         = params.topPResetIds.size() ? std::make_optional<std::vector<int32_t>>(params.topPResetIds) : std::nullopt;
 
     mSamplingLayer->setup(mBatchSize, mBeamWidth, batchSlotsPtr, setupParams);
@@ -109,42 +110,40 @@ void BaseSamplingLayerTest<T>::setup(uint64_t seed, TestSamplingParams const& pa
 }
 
 template <typename T>
-std::shared_ptr<SamplingInputs> BaseSamplingLayerTest<T>::createInputTensors(int32_t step)
+std::shared_ptr<SamplingInputParams> BaseSamplingLayerTest<T>::createInputTensors(int32_t step)
 {
     constexpr int32_t ite = 0;
-    auto decodeInputTensors
-        = std::make_shared<SamplingInputs>(tcc::toTllmTensor(*mEndIdsDevice), step, ite, mBatchSize);
+    auto decodeInputTensors = std::make_shared<SamplingInputParams>(
+        step, ite, tcc::toTllmTensor(*mLogitsDevice), tcc::toTllmTensor(*mEndIdsDevice), mMaxSeqLen);
 
-    decodeInputTensors->logits = tcc::toTllmTensor(*mLogitsDevice);
-
-    decodeInputTensors->inputLengths = tcc::toTllmTensor(*mContextLengthDevice);
+    decodeInputTensors->input_lengths = tcc::toTllmTensor(*mContextLengthDevice);
 
     decodeInputTensors->finished = tcc::toTllmTensor(*mFinishedDevice);
 
-    decodeInputTensors->batchSlots = tcc::toTllmTensor(*mBatchSlots);
+    decodeInputTensors->batch_slots = tcc::toTllmTensor(*mBatchSlots);
 
-    decodeInputTensors->probsComputed = mComputeProbs;
+    decodeInputTensors->probs_computed = mComputeProbs;
 
-    decodeInputTensors->curandStates = reinterpret_cast<curandState_t*>(bufferCast<int8_t>(*mCurandStatesDevice));
+    decodeInputTensors->curand_states = reinterpret_cast<curandState_t*>(bufferCast<int8_t>(*mCurandStatesDevice));
 
-    decodeInputTensors->samplingWorkspace = reinterpret_cast<void*>(bufferCast<int8_t>(*mSamplingWorkspaceDevice));
+    decodeInputTensors->sampling_workspace = reinterpret_cast<void*>(bufferCast<int8_t>(*mSamplingWorkspaceDevice));
 
     return decodeInputTensors;
 }
 
 template <typename T>
-std::shared_ptr<BaseDecodingOutputs> BaseSamplingLayerTest<T>::createOutputTensors()
+std::shared_ptr<SamplingOutputParams> BaseSamplingLayerTest<T>::createOutputTensors()
 {
-    auto decodeOutputs = std::make_shared<BaseDecodingOutputs>(tcc::toTllmTensor(*mOutputIdsDevice));
-    decodeOutputs->outputIdsPtr = tcc::toTllmTensor(*mIdsPtrHost);
+    auto decodeOutputs = std::make_shared<SamplingOutputParams>(tcc::toTllmTensor(*mOutputIdsDevice));
+    decodeOutputs->output_ids_ptr = tcc::toTllmTensor(*mIdsPtrHost);
 
-    decodeOutputs->sequenceLength = tcc::toTllmTensor(*mSeqLengthsDevice);
+    decodeOutputs->sequence_length = tcc::toTllmTensor(*mSeqLengthsDevice);
 
     decodeOutputs->finished = tcc::toTllmTensor(*mFinishedDevice);
 
-    decodeOutputs->outputLogProbs = tcc::toTllmTensor(*mOutputLogProbsDevice);
+    decodeOutputs->output_log_probs = tcc::toTllmTensor(*mOutputLogProbsDevice);
 
-    decodeOutputs->cumLogProbs = tcc::toTllmTensor(*mCumLogProbsDevice);
+    decodeOutputs->cum_log_probs = tcc::toTllmTensor(*mCumLogProbsDevice);
 
     // TODO(nkorobov): check log probs and cum_log_probs
     return decodeOutputs;

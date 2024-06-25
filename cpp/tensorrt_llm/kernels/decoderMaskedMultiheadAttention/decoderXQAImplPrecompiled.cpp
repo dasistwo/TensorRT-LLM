@@ -160,13 +160,7 @@ public:
             : (xqaParams.kv_cache_quant_mode.hasFp8KvCache() ? KvCacheDataType::FP8 : KvCacheDataType::BASE);
 
         XQALaunchParam<KVCacheBuffer> launchParams;
-        void* ioScratch = nullptr;
-        buildXQALaunchParams(launchParams, ioScratch, xqaParams, kv_cache_buffer);
-        bool const needOutputCvt = (xqaParams.fp8_out_scale != nullptr);
-        if (needOutputCvt)
-        {
-            launchParams.output = ioScratch;
-        }
+        buildXQALaunchParams(launchParams, xqaParams, kv_cache_buffer);
 
         // Build cu_seqlens, padding_offset, and rotary inv freq tensors
         BuildDecoderInfoParams<T> decoder_params;
@@ -192,14 +186,14 @@ public:
 
         // IDEA: Store rotary_processed Q buffer to output buffer.
         // NOTE: MHA kernels should read kv cache that has already been appended with new tokens' kv cache.
-        void* xqa_q_input_ptr = ioScratch;
+        void const* xqa_q_input_ptr = xqaParams.output;
         QKVPreprocessingParams<T, KVCacheBuffer> preprocessingParms{static_cast<T*>(const_cast<void*>(xqaParams.qkv)),
-            nullptr, static_cast<T*>(xqa_q_input_ptr), kv_cache_buffer, static_cast<T const*>(xqaParams.qkv_bias),
-            xqaParams.spec_decoding_generation_lengths, xqaParams.sequence_lengths,
-            xqaParams.multi_query_tokens ? launchParams.cu_seq_lens : nullptr, launchParams.rotary_inv_freq_buf,
-            (float2 const*) nullptr, xqaParams.kv_scale_orig_quant, xqaParams.spec_decoding_position_offsets,
-            int(batch_beam_size), xqaParams.generation_input_length, xqaParams.timestep,
-            xqaParams.cyclic_attention_window_size, xqaParams.sink_token_length,
+            nullptr, static_cast<T*>(const_cast<void*>(xqaParams.output)), kv_cache_buffer,
+            static_cast<T const*>(xqaParams.qkv_bias), xqaParams.spec_decoding_generation_lengths,
+            xqaParams.sequence_lengths, xqaParams.multi_query_tokens ? launchParams.cu_seq_lens : nullptr,
+            launchParams.rotary_inv_freq_buf, (float2 const*) nullptr, xqaParams.kv_scale_orig_quant,
+            xqaParams.spec_decoding_position_offsets, int(batch_beam_size), xqaParams.generation_input_length,
+            xqaParams.timestep, xqaParams.cyclic_attention_window_size, xqaParams.sink_token_length,
             int(xqaParams.batch_size * beam_width * xqaParams.generation_input_length), xqaParams.num_q_heads,
             xqaParams.num_kv_heads, xqaParams.num_q_heads / xqaParams.num_kv_heads, xqaParams.head_size,
             xqaParams.rotary_embedding_dim, xqaParams.rotary_embedding_base, xqaParams.rotary_embedding_scale_type,
@@ -213,7 +207,14 @@ public:
         // Use mTileSize = 16 kernels when qSeqLen <= 16.
         unsigned int qSeqLen = static_cast<unsigned int>(xqaParams.generation_input_length);
         unsigned int mTileSize = qSeqLen <= 16 ? 16 : 32;
-        XQAKernelRuntimeHashKey hash_key = getRuntimeHashKeyFromXQAParams(xqaParams);
+        // MultiQueryToken kernels can support any num_q_heads_over_kv that is power of 2.
+        unsigned int kernel_num_q_heads_over_kv = xqaParams.multi_query_tokens ? 0 : num_q_heads_over_kv;
+        // MultiQueryToken kernels can handle either 16/32 for M direction per CTA.
+        unsigned int kernel_m_tilesize = xqaParams.multi_query_tokens ? mTileSize : num_q_heads_over_kv;
+        XQAKernelRuntimeHashKey hash_key{xqaParams.kv_cache_data_type, head_size, beam_width,
+            kernel_num_q_heads_over_kv, kernel_m_tilesize,
+            xqaParams.paged_kv_cache ? static_cast<unsigned int>(xqaParams.tokens_per_block) : 0,
+            xqaParams.paged_kv_cache, xqaParams.multi_query_tokens};
         auto const findIter = mFunctions.find(hash_key);
 
         TLLM_CHECK_WITH_INFO(findIter != mFunctions.end(), "XQAKernelFunc not found.");
@@ -292,15 +293,28 @@ public:
         }
 
         sync_check_cuda_error();
+    }
 
-        if (needOutputCvt)
+private:
+    static uint32_t getElemBytes(CUtensorMapDataType_enum dataType)
+    {
+        switch (dataType)
         {
-            tensorrt_llm::kernels::invokeConversion<__nv_fp8_e4m3, T>(static_cast<__nv_fp8_e4m3*>(xqaParams.output),
-                static_cast<T const*>(launchParams.output),
-                xqaParams.head_size * xqaParams.num_q_heads * xqaParams.total_num_input_tokens, xqaParams.fp8_out_scale,
-                stream);
-            sync_check_cuda_error();
+        case CU_TENSOR_MAP_DATA_TYPE_UINT8: return 1;
+        case CU_TENSOR_MAP_DATA_TYPE_UINT16: return 2;
+        case CU_TENSOR_MAP_DATA_TYPE_UINT32: return 4;
+        case CU_TENSOR_MAP_DATA_TYPE_INT32: return 4;
+        case CU_TENSOR_MAP_DATA_TYPE_UINT64: return 8;
+        case CU_TENSOR_MAP_DATA_TYPE_INT64: return 8;
+        case CU_TENSOR_MAP_DATA_TYPE_FLOAT16: return 2;
+        case CU_TENSOR_MAP_DATA_TYPE_FLOAT32: return 4;
+        case CU_TENSOR_MAP_DATA_TYPE_FLOAT64: return 8;
+        case CU_TENSOR_MAP_DATA_TYPE_BFLOAT16: return 2;
+        case CU_TENSOR_MAP_DATA_TYPE_FLOAT32_FTZ: return 4;
+        case CU_TENSOR_MAP_DATA_TYPE_TFLOAT32: return 4;
+        case CU_TENSOR_MAP_DATA_TYPE_TFLOAT32_FTZ: return 4;
         }
+        throw std::runtime_error("unsupported data type");
     }
 
 protected:

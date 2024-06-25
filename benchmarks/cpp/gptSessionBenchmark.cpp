@@ -34,7 +34,6 @@
 #include <NvInfer.h>
 #include <atomic>
 #include <chrono>
-#include <cuda_profiler_api.h>
 #include <cxxopts.hpp>
 #include <future>
 #include <sstream>
@@ -214,7 +213,6 @@ void benchmarkGptSession(std::filesystem::path const& dataPath, std::vector<int>
                 std::vector<float> latencies;
                 std::vector<float> generationTimes;
                 auto generationProfiler = std::make_shared<GptSession::GenerationProfiler>();
-                cudaProfilerStart();
                 while (iterIdx < numRuns)
                 {
                     auto const start = std::chrono::steady_clock::now();
@@ -244,7 +242,6 @@ void benchmarkGptSession(std::filesystem::path const& dataPath, std::vector<int>
                         break;
                     }
                 }
-                cudaProfilerStop();
 
                 TLLM_LOG_INFO(memoryCounter.toString());
                 done = true;

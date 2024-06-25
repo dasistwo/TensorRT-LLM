@@ -60,8 +60,7 @@ private:
     bool mForceXQA;
     int mSM;
 
-    jit::CubinObjRegistry mInitializedCubinObjRegistry;
-
+    jit::CubinObjRegistry* mCubinObjRegistry;
     jit::CubinObjKey getCubinObjKeyFromXQAParams(XQAParams const& xqaParams) const;
 
     //! The first prototype just takes whatever available from the Precompiled cubins.

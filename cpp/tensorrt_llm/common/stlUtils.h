@@ -15,11 +15,9 @@
  */
 
 #pragma once
-
+#include "tensorrt_llm/common/assert.h"
 #include <functional>
 #include <numeric>
-#include <optional>
-#include <sstream>
 
 namespace tensorrt_llm::common::stl_utils
 {

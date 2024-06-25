@@ -20,8 +20,9 @@ class Arguments:
 
     model_cache: str = '/llm-models'
 
-    tp: int = 1
-    pp: int = 1
+    # override by --only_multi_gpu, enforced by test_cpp.py
+    tp: int = 2
+    pp: int = 2
 
     beams: int = 1
     gpus_per_node: int = 4
@@ -29,8 +30,9 @@ class Arguments:
 
     rm_pad: bool = True
     gemm: bool = True
+    # rmsm: bool = True # TODO: remove this
 
-    max_new_tokens: int = 64
+    max_new_tokens: int = 10
 
     @property
     def ckpt(self):
@@ -71,13 +73,20 @@ class Arguments:
             k = k.name
             v = getattr(self, k)
             if isinstance(v, bool):
-                parser.add_argument(f'--{k}', action='store_true')
+                parser.add_argument(f'--{k}', default=int(v), type=int)
             else:
                 parser.add_argument(f'--{k}', default=v, type=type(v))
 
+        parser.add_argument('--only_multi_gpu', action='store_true')
         args = parser.parse_args()
         for k, v in args._get_kwargs():
             setattr(self, k, v)
+        if args.only_multi_gpu:
+            self.tp = 2
+            self.pp = 2
+        else:
+            self.tp = 1
+            self.pp = 1
 
 
 @dataclass
@@ -122,14 +131,14 @@ class Build(RunCMDMixin):
 
     def command(self):
         args = self.args
-        engine_dir = args.engines_dir
-        weight_dir = args.trt_models_dir
+        engine_dir = join(args.engines_dir, f'tp{args.tp}')
+        weight_dir = join(args.trt_models_dir, f'tp{args.tp}', f'pp{args.pp}')
         encoder_build = [
             f"trtllm-build --checkpoint_dir {join(weight_dir, 'encoder')}",
             f"--output_dir {join(engine_dir, 'encoder')}",
             f'--paged_kv_cache disable', f'--moe_plugin disable',
             f'--enable_xqa disable', f'--max_beam_width {args.beams}',
-            f'--max_batch_size 8', f'--max_seq_len 1224',
+            f'--max_batch_size 8', f'--max_output_len 200',
             f'--gemm_plugin {args.dtype}',
             f'--bert_attention_plugin {args.dtype}',
             f'--gpt_attention_plugin {args.dtype}',
@@ -140,9 +149,9 @@ class Build(RunCMDMixin):
         decoder_build = [
             f"trtllm-build --checkpoint_dir {join(weight_dir, 'decoder')}",
             f"--output_dir {join(engine_dir, 'decoder')}",
-            f'--paged_kv_cache enable', f'--moe_plugin disable',
+            f'--paged_kv_cache disable', f'--moe_plugin disable',
             f'--enable_xqa disable', f'--max_beam_width {args.beams}',
-            f'--max_batch_size 8', f'--max_seq_len 201',
+            f'--max_batch_size 8', f'--max_output_len 200',
             f'--gemm_plugin {args.dtype}',
             f'--bert_attention_plugin {args.dtype}',
             f'--gpt_attention_plugin {args.dtype}',

@@ -22,12 +22,8 @@
 #include "tensorrt_llm/runtime/iBuffer.h"
 
 #include <csignal>
-#include <cstdlib>
 #include <mutex>
 #include <type_traits>
-#ifndef _WIN32
-#include <unistd.h>
-#endif
 
 // We rely on SizeType32 being int32_t in some places with weak type checking,
 // i.e. we're passing void ptr to some function. To prevent mysterious errors
@@ -95,7 +91,7 @@ std::mutex mpiMutex;
 
 } // namespace
 
-void initialize(MpiThreadSupport threadMode, bool forwardAbortToParent)
+void initialize(MpiThreadSupport threadMode)
 {
     std::lock_guard<std::mutex> lk(mpiMutex);
     if (mpiInitialized)
@@ -114,36 +110,11 @@ void initialize(MpiThreadSupport threadMode, bool forwardAbortToParent)
         TLLM_CHECK_WITH_INFO(providedMode >= requiredMode, "MPI_Init_thread failed");
         std::atexit([]() { MPI_Finalize(); });
 
-        /*
-         * We only catch SIGABRT and SIGSEGV because most, of not all errors in the worker will cause one of these 2
-         * signals. Signals like SIGINT and SIGTERM should be issued to the parent and should terminate MPI workers
-         * correctly.
-         */
-        for (int sig : {SIGABRT, SIGSEGV})
-        {
-            __sighandler_t previousHandler = nullptr;
-            if (forwardAbortToParent)
-            {
-                previousHandler = std::signal(sig,
-                    [](int signal)
-                    {
-#ifndef _WIN32
-                        pid_t parentProcessId = getppid();
-                        kill(parentProcessId, SIGKILL);
-#endif
-                        MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
-                    });
-            }
-            else
-            {
-                previousHandler = std::signal(sig, [](int signal) { MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE); });
-            }
-            TLLM_CHECK_WITH_INFO(previousHandler != SIG_ERR, "Signal handler setup failed");
-        }
+        auto previousHandler = std::signal(SIGABRT, [](int signal) { MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE); });
+        TLLM_CHECK_WITH_INFO(previousHandler != SIG_ERR, "Signal handler setup failed");
 
         // ensure local MPI communicator is initialized
         MpiComm::localSession();
-        TLLM_LOG_INFO("Initialized MPI");
     }
 #endif // ENABLE_MULTI_DEVICE
     mpiInitialized = true;

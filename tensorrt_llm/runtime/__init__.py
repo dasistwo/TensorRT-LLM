@@ -16,7 +16,7 @@ from .generation import SamplingConfig  # autoflake: skip
 from .generation import (ChatGLMGenerationSession, GenerationSession,
                          LogitsProcessor, LogitsProcessorList, ModelConfig,
                          QWenForCausalLMGenerationSession, StoppingCriteria,
-                         StoppingCriteriaList, decode_words_list)
+                         StoppingCriteriaList, to_word_list_format)
 from .kv_cache_manager import GenerationSequence, KVCacheManager
 from .model_runner import ModelRunner
 from .session import Session, TensorInfo
@@ -40,7 +40,7 @@ __all__ = [
     'TensorInfo',
     'ChatGLMGenerationSession',
     'QWenForCausalLMGenerationSession',
-    'decode_words_list',
+    'to_word_list_format',
     'LogitsProcessorList',
     'LogitsProcessor',
     'StoppingCriteriaList',

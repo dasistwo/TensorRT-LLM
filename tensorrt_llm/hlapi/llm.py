@@ -7,34 +7,35 @@ from argparse import Namespace
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional, Union
+from typing import Any, Iterable, List, Optional, Union
 
 import tensorrt as trt
 import torch
 
+from .. import bindings as tllm
 from .._utils import mpi_barrier, mpi_rank, release_gc
 from ..auto_parallel import AutoParallelConfig, infer_cluster_config
-from ..bindings import executor as tllm
-from ..bindings.executor import (CapacitySchedulerPolicy, DecodingConfig,
-                                 KvCacheConfig)
+from ..bindings import KvCacheConfig
+from ..bindings.executor import CapacitySchedulerPolicy
 from ..builder import BuildConfig, Engine, EngineConfig, build
 from ..executor import GenerationExecutor, GenerationResult
 from ..logger import logger
 from ..mapping import Mapping
-from ..models import MODEL_MAP
-from ..models.modeling_utils import PretrainedConfig, QuantAlgo, QuantConfig
+from ..models.modeling_utils import (PretrainedConfig, QuantAlgo, QuantConfig,
+                                     load_model)
 from ..module import Module
 from .mpi_session import (MpiCommSession, MPINodeState, MpiPoolSession,
                           MpiSession, external_mpi_comm_available)
 from .tokenizer import TokenizerBase, TransformersTokenizer
-from .utils import (GenerationOutput, GpuArch, SamplingParams,
-                    download_hf_model, exception_handler, file_with_glob_exists,
-                    file_with_suffix_exists, get_device_count, init_log_level,
-                    print_colored, print_traceback_on_error)
+from .utils import (GenerationOutput, GpuArch, OutputConfig, SamplingConfig,
+                    file_with_glob_exists, file_with_suffix_exists,
+                    get_device_count, print_colored, print_traceback_on_error,
+                    suppress_runtime_log)
 
-init_log_level(
+suppress_runtime_log(
 )  # This should be called before importing the following cpp-runtime modules
 
+from ..bindings.executor import CapacitySchedulerPolicy
 from ..builder import BuildConfig, Engine, EngineConfig, build
 from ..executor import GenerationExecutor, GenerationResult
 
@@ -97,10 +98,11 @@ class ModelConfig:
 
     # ``model_dir`` helps to locate a local model, the format of the model is determined by the model file itself.
     # Either HF model, TensorRT-LLM checkpoints or TensorRT-LLM engine format is supported.
-    model_dir: Optional[str] = None
+    model_dir: str
 
-    # ``model`` could either be the model directory or a in-memory model.
-    # ``model`` specifies the model kind like "llama-7B", etc.
+    # ``model`` could either the model directory or a in-memory model.
+    # If ``model`` specifies the model kind like "llama-7B", etc.  The model will be download automatically from third-party
+    # model hub like www.modelscope.cn or huggingface
     model: Optional[Union[str, Module]] = None
 
     # ``parallel_config`` is used to specify the parallelism of the model.
@@ -116,12 +118,13 @@ class ModelConfig:
         repr=False)
 
     def __post_init__(self):
-        if not (self.model_dir or self.model):
-            raise ValueError("Either model_dir or model should be provided.")
-        if self.model_dir and self.model:
+        if self.model:
+            raise NotImplementedError("model is not supported yet.")
+
+        model_path = Path(self.model_dir)
+        if not model_path.exists():
             raise ValueError(
-                "Only one of model_dir or model should be provided, provided both."
-            )
+                f"model_dir of path {self.model_dir} does not exist.")
 
         self._engine_config: Optional[EngineConfig] = None
 
@@ -136,22 +139,15 @@ class ModelConfig:
             **infer_cluster_config(),
         )
 
-        if self.model_dir:
-            model_path = Path(self.model_dir)
-            if not model_path.exists():
-                raise ValueError(
-                    f"model_dir of path {self.model_dir} does not exist.")
+        # Load parallel_config from the engine.
+        self.model_format = ModelLoader.get_model_format(self.model_dir)
+        if self.model_format is _ModelFormatKind.TLLM_ENGINE:
+            self._load_config_from_engine(Path(self.model_dir))
 
-            # Load parallel_config from the engine.
-            self.model_format = ModelLoader.get_model_format(self.model_dir)
-            if self.model_format is _ModelFormatKind.TLLM_ENGINE:
-                self._load_config_from_engine(Path(self.model_dir))
-
-            # Load parallel_config from the checkpoint.
-            if self.model_format is _ModelFormatKind.TLLM_CKPT:
-                self._load_config_from_ckpt(Path(self.model_dir))
-        else:
-            self.model_format = _ModelFormatKind.HF
+        # Load parallel_config from the checkpoint.
+        if ModelLoader.get_model_format(
+                self.model_dir) is _ModelFormatKind.TLLM_CKPT:
+            self._load_config_from_ckpt(Path(self.model_dir))
 
     def _update_plugin_config(self, key: str, value: Any):
         if key == 'use_paged_context_fmha':
@@ -249,11 +245,7 @@ class LLM:
                  config: ModelConfig,
                  *,
                  tokenizer: Optional[TokenizerBase] = None,
-                 dtype: str = 'auto',
                  kv_cache_config: Optional[KvCacheConfig] = None,
-                 logits_post_processor_map: Optional[Dict[str, Callable[
-                     [int, torch.Tensor, List[List[int]], int], None]]] = None,
-                 decoding_config: Optional[DecodingConfig] = None,
                  streaming_llm: Union[bool, StreamingLLMParam] = False,
                  async_engine_tmp_dir: Optional[str] = None,
                  **_additional_options: Any):
@@ -263,16 +255,8 @@ class LLM:
                 The model config for the model.
             tokenizer (TokenizerBase):
                 User provided tokenizer, will override the default one if exists in the HF model or TRT-LLM engine.
-            dtype (str):
-                The data type for the model weights and activations (non-quantized). You can
-                (1) explicitly specify `float16`, `bfloat16` or `float32`; or
-                (2) implicitly specify `auto` (default), then `dtype` will be automatically inferred from the source model. However, if the source `dtype` is `float32`, will use `float16` instead.
             kv_cache_config (KvCacheConfig):
                 The config for the paged KV cache.
-            logits_post_processor_map (Dict[str, Callable[[int, torch.Tensor, List[List[int]], int], None]]):
-                Optional, a map of logits post processor functions.
-            decoding_config (DecodingConfig):
-                Optional, the config for speculative decoding.
             streaming_llm (bool, StreamingLLMParam):
                 Whether to enable the streaming LLM mode.
             async_engine_tmp_dir (str):
@@ -295,18 +279,13 @@ class LLM:
                 'SHARDING_ALONG_HIDDEN' means parallelism enabled with lookup table weight sharded along the hidden dimension.
             share_embedding_table (bool):
                 Whether to share the weight between token embedding lookup table and lm_head.
-            peft_cache_config (PeftCacheConfig)
-                The configuration for the peft cache.
         '''
 
         self.config = config
 
         self._tokenizer = tokenizer
-        self.dtype = dtype
         self.async_engine_tmp_dir = async_engine_tmp_dir
         self.kv_cache_config = kv_cache_config
-        self.logits_post_processor_map = logits_post_processor_map
-        self.decoding_config = decoding_config
         # TODO[chunweiy]: add doc for enable_streaming_llm
         self.enable_streaming_llm = streaming_llm
         if self.enable_streaming_llm is True:
@@ -327,8 +306,6 @@ class LLM:
             CapacitySchedulerPolicy.GUARANTEED_NO_EVICT)
         self.context_chunking_policy = _additional_options.pop(
             'context_chunking_policy', None)
-        self.peft_cache_config = _additional_options.pop(
-            'peft_cache_config', None)
 
         self._convert_checkpoint_options = {}
         # TODO: Move these options to ParallelConfig
@@ -440,100 +417,114 @@ class LLM:
                                                       True)
 
         self._build_model()
-        exception_handler.register(self)
 
     def generate(
         self,
         prompts: Union[Iterable[str], Iterable[List[int]]],
-        sampling_params: Optional[Union[SamplingParams,
-                                        List[SamplingParams]]] = None,
+        sampling_config: Optional[Union[SamplingConfig,
+                                        List[SamplingConfig]]] = None,
+        output_config: Optional[OutputConfig] = None,
+        bad_words: Optional[List[List[int]]] = None,
+        stop_words: Optional[List[List[int]]] = None,
     ) -> Iterable[GenerationOutput]:
         ''' Generate the output for the given inputs.
 
         Args:
             prompts: The raw text or token ids to the model.
-            sampling_params: The sampling params for the generation, a default one will be used if not provided.
+            sampling_config: The sampling config for the generation, a default one will be used if not provided.
         '''
         prompts = list(prompts)
 
-        sampling_params = self._prepare_sampling_params(sampling_params)
-        self._generate_check_arguments(prompts, sampling_params)
-        results = self._executor.generate(prompts,
-                                          sampling_params=sampling_params)
+        if sampling_config is None:
+            sampling_config = self.get_default_sampling_config()
+        else:
+            _sampling_config = sampling_config if isinstance(
+                sampling_config, list) else [sampling_config]
+            for sc in _sampling_config:
+                if sc.end_id is None:
+                    if self.tokenizer is None:
+                        raise ValueError(
+                            f"end_id is required in the sampling_config if tokenizer is not provided."
+                        )
+                    sc.end_id = self.tokenizer.eos_token_id
+                    sc.pad_id = self.tokenizer.eos_token_id
+
+        output_config = output_config or OutputConfig()
+
+        results = self._executor.generate(
+            prompts,
+            sampling_config=sampling_config,
+            output_config=output_config,
+            bad_words=bad_words,
+            stop_words=stop_words,
+        )
 
         return results
 
-    def generate_async(self,
-                       prompt: Union[str, List[int]],
-                       sampling_params: Optional[SamplingParams] = None,
-                       streaming: bool = False) -> GenerationResult:
+    def generate_async(
+            self,
+            prompt: Union[str, List[int]],
+            sampling_config: Optional[SamplingConfig] = None,
+            output_config: Optional[OutputConfig] = None,
+            streaming: bool = False,
+            bad_words: Optional[List[int]] = None,
+            stop_words: Optional[List[int]] = None) -> GenerationResult:
         ''' Generate in asynchronuous mode.
 
         Args:
             prompt: The raw text or token ids to the model.
-            sampling_params: The sampling params for the generation, a default one will be used if not provided.
+            sampling_config: The sampling config for the generation, a default one will be used if not provided.
             streaming: Whether to use the streaming mode for the generation.
         '''
-        sampling_params = self._prepare_sampling_params(sampling_params)
-        self._generate_check_arguments([prompt], sampling_params)
+        if sampling_config is None:
+            sampling_config = self.get_default_sampling_config()
+        self._generate_check_arguments([prompt], sampling_config)
+
+        output_config = output_config or OutputConfig()
 
         results = self._executor.generate_async(
             prompt,
             streaming=streaming,
-            sampling_params=sampling_params,
+            sampling_config=sampling_config,
+            output_config=output_config,
+            stop_words=[stop_words] if stop_words is not None else None,
+            bad_words=[bad_words] if bad_words is not None else None,
         )
         return results
 
-    def _prepare_sampling_params(
-        self,
-        sampling_params: Optional[Union[SamplingParams,
-                                        List[SamplingParams]]] = None):
-        if sampling_params is None:
-            if self.tokenizer is None:
-                raise ValueError(
-                    "tokenizer is required to initialize a default sampling_params, or you can explicitly specify a sampling_params"
-                )
-            return SamplingParams(end_id=self.tokenizer.eos_token_id,
-                                  pad_id=self.tokenizer.pad_token_id)
-        if isinstance(sampling_params, SamplingParams):
-            sampling_params = [sampling_params]
-        for sp in sampling_params:
-            if sp.end_id is None:
-                if self.tokenizer is None:
-                    raise ValueError(
-                        "tokenizer is required to reset end_id if it is None, or you can explicitly specify the end_id for sampling_params"
-                    )
-                sp.end_id = self.tokenizer.eos_token_id
-                sp.pad_id = self.tokenizer.pad_token_id
-        if len(sampling_params) == 1:
-            sampling_params = sampling_params[0]
-        return sampling_params
-
     def _generate_check_arguments(self, prompts,
-                                  sampling_params: SamplingParams):
-        if sampling_params is None:
-            raise ValueError("The sampling_params should be provided.")
+                                  sampling_config: SamplingConfig):
+        if sampling_config is None:
+            raise ValueError("The sampling_config should to be provided.")
+        if sampling_config.top_k is not None or sampling_config.top_p is not None:
+            raise ValueError("The top_k and top_p are not supported yet.")
 
         build_config = self.config.build_config
 
-        for i, prompt in enumerate(prompts):
-            if isinstance(sampling_params, list):
-                sp = sampling_params[i]
-            else:
-                sp = sampling_params
-            if isinstance(prompt, list):
-                prompt_len = len(prompt)
-            else:
-                # TODO(enweiz): move tokenizer from GenerationExecutor to LLM and validate on token ids here
-                prompt_len = len(prompt.split())
+        sampling_configs = [sampling_config] if isinstance(
+            sampling_config, SamplingConfig) else sampling_config
+        max_num_beams = max([sc.beam_width for sc in sampling_configs])
+        if max_num_beams > build_config.max_beam_width:
+            raise ValueError(
+                f"num_beams is larger than the maximum in the built engine {max_num_beams} > {build_config.max_beam_width}"
+            )
+        if len(prompts) > build_config.max_batch_size:
+            raise ValueError(
+                f"Batch size {len(prompts)} is larger than the maximum in the built engine {build_config.max_batch_size}"
+            )
 
-            if prompt_len + sp.max_new_tokens > build_config.max_seq_len:
+        input_digits = False
+        if isinstance(prompts[0], list):
+            input_digits = True
+        if input_digits and sum(
+                len(prompt)
+                for prompt in prompts) > build_config.max_num_tokens:
+            raise ValueError(f"The total input length is too large")
+        if not input_digits:
+            if max(len(prompt.split())
+                   for prompt in prompts) > build_config.max_input_len:
                 raise ValueError(
-                    f"The sum of prompt length ({prompt_len}) and max_new_tokens ({sp.max_new_tokens}) should not exceed "
-                    f"max_seq_len ({build_config.max_seq_len})")
-            if sp.beam_width > build_config.max_beam_width:
-                raise ValueError(
-                    f"sampling_params's beam_width ({sp.beam_width}) should not exceed max_beam_width ({build_config.max_beam_width})"
+                    f"Input length is larger than the maximum in the built engine"
                 )
 
     @property
@@ -592,8 +583,26 @@ class LLM:
                              engine_dir=engine_dir,
                              model_info=self.runtime_context.model_info)
 
+    def get_default_sampling_config(self) -> Optional[SamplingConfig]:
+        ''' Get the default sampling config for the model.
+        You can override the options.
+        '''
+        tokenizer = self.tokenizer
+        if tokenizer is None:
+            try:
+                tokenizer = ModelLoader.load_hf_tokenizer(self.config.model_dir)
+            except:
+                return None
+
+        return SamplingConfig(
+            end_id=tokenizer.eos_token_id,
+            pad_id=tokenizer.eos_token_id
+            if tokenizer.pad_token_id is None else tokenizer.pad_token_id,
+        )
+
     def _build_model(self):
-        model_format = self.config.model_format
+        model_format = ModelLoader.get_model_format(self.config.model_dir)
+
         self._engine_dir = self.config.model_dir
 
         def get_engine_dir():
@@ -615,7 +624,6 @@ class LLM:
                     LLM._node_build_task,
                     self.config,
                     self._tokenizer,
-                    self.dtype,
                     self._workspace.name,
                     build_config=self.config.build_config,
                     convert_checkpoint_options=self._convert_checkpoint_options,
@@ -629,7 +637,6 @@ class LLM:
                 with ModelLoader(
                         self.config,
                         tokenizer=self._tokenizer,
-                        dtype=self.dtype,
                         workspace=self._workspace.name,
                         build_config=self.config.build_config,
                         convert_checkpoint_options=self.
@@ -653,29 +660,21 @@ class LLM:
         if not isinstance(tokenizer, TokenizerBase):
             tokenizer = ModelLoader.load_hf_tokenizer(self.config.model_dir)
 
-        executor_config = tllm.ExecutorConfig(
-            max_beam_width=self.config.build_config.max_beam_width,
-            scheduler_config=tllm.SchedulerConfig(
-                self.capacity_scheduling_policy, self.context_chunking_policy),
-            batching_type=tllm.BatchingType.INFLIGHT)
+        executor_config = tllm.TrtGptModelOptionalParams()
         if self.kv_cache_config is not None:
             executor_config.kv_cache_config = self.kv_cache_config
-        if self.peft_cache_config is not None:
-            executor_config.peft_cache_config = self.peft_cache_config
-        if self.decoding_config is not None:
-            executor_config.decoding_config = self.decoding_config
-        if self.logits_post_processor_map is not None:
-            executor_config.logits_post_processor_map = self.logits_post_processor_map
         executor_config.normalize_log_probs = self.normalize_log_probs
         executor_config.enable_chunked_context = self.enable_chunked_context
-        executor_config.max_beam_width = self.config.build_config.max_beam_width
-
         self._executor = GenerationExecutor.create(
             get_engine_dir(),
             tokenizer,
+            max_beam_width=self.config.build_config.max_beam_width,
             executor_config=executor_config,
+            scheduler_config=tllm.executor.SchedulerConfig(
+                self.capacity_scheduling_policy, self.context_chunking_policy),
             model_world_size=self.config.parallel_config.world_size,
             mpi_session=self.mpi_session,
+            executor_type=tllm.TrtGptModelType.InflightFusedBatching,
             reuse_mpi_comm=external_mpi_comm_available(
                 self.config.parallel_config.world_size))
 
@@ -684,7 +683,6 @@ class LLM:
     def _node_build_task(
             config: ModelConfig,
             tokenizer: Optional[TokenizerBase] = None,
-            dtype: str = 'auto',
             workspace: Optional[str] = None,
             build_config: Optional[BuildConfig] = None,
             convert_checkpoint_options: Optional[dict] = None) -> bool:
@@ -693,7 +691,6 @@ class LLM:
 
         with ModelLoader(config,
                          tokenizer=tokenizer,
-                         dtype=dtype,
                          workspace=workspace,
                          build_config=build_config,
                          convert_checkpoint_options=convert_checkpoint_options
@@ -798,13 +795,11 @@ class ModelLoader:
     def __init__(self,
                  config: ModelConfig,
                  tokenizer: Optional[TokenizerBase],
-                 dtype: str = 'auto',
                  workspace: Optional[str] = None,
                  build_config: Optional[BuildConfig] = None,
                  convert_checkpoint_options: Optional[dict] = None):
         self.config = config
         self.tokenizer = tokenizer
-        self.dtype = dtype
         self.workspace = workspace
 
         assert build_config
@@ -848,14 +843,12 @@ class ModelLoader:
 
         if self.config.model_dir is None:
             ''' Download HF model if necessary '''
-            if self.config.model is None:
-                raise ValueError(
-                    "Either model_dir or model should be provided to ModelConfig."
-                )
-            self._model_pipeline.append(
-                ("Downloading HF model", self._download_hf_model))
+            # TODO[chunweiy]: Support HF model download
+            raise NotImplementedError()
 
-        self._model_format = self.config.model_format
+        if self._model_dir is None:
+            raise ValueError("The model_dir is not set yet.")
+        self._model_format = ModelLoader.get_model_format(self._model_dir)
 
         if self._model_format is _ModelFormatKind.HF:
             ''' HF -> TRT checkpoints -> engine '''
@@ -988,12 +981,8 @@ class ModelLoader:
         raise ValueError(f"Unknown model format for {model_dir}")
 
     def _download_hf_model(self):
-        ''' Download HF model. '''
-        assert self.workspace is not None
-        assert isinstance(self.config.model, str)
-        self._model_dir = download_hf_model(self.config.model)
-        self.config.model_dir = self._model_dir
-        print_colored(f"Downloaded model to {self._model_dir}\n", 'grey')
+        ''' Download HF model from third-party model hub like www.modelscope.cn or huggingface.  '''
+        raise NotImplementedError()
 
     def _load_model_from_hf(self):
         ''' Load a TRT-LLM model from a HF model. '''
@@ -1016,32 +1005,28 @@ class ModelLoader:
                 f"Unsupported model architecture: {model_arch}, "
                 f"only {', '.join(model2struct.keys())} are supported now.")
 
-        model_cls = model2struct[model_arch]
-
         if self.config.quant_config.quant_mode.has_any_quant():
             assert self.workspace is not None
             checkpoint_dir = f"{self.workspace}/quantized-checkpoint"
             if self.rank == 0:
-                model_cls.quantize(
+                model2struct[model_arch].quantize(
                     self._model_dir,
                     checkpoint_dir,
-                    dtype=self.dtype,
+                    self.config.quant_config,
                     mapping=self.mapping,
-                    quant_config=self.config.quant_config,
                 )
             if self.config.parallel_config.is_multi_gpu:
                 mpi_barrier()
-            self.model = model_cls.from_checkpoint(checkpoint_dir,
-                                                   rank=self.mapping.rank)
+            self.model = model2struct[model_arch].from_checkpoint(
+                checkpoint_dir, rank=self.mapping.rank)
         else:
-            self.model = model_cls.from_hugging_face(
+            self.model = model2struct[model_arch].from_hugging_face(
                 self._model_dir,
-                dtype=self.dtype,
                 mapping=self.mapping,
-                quant_config=self.config.quant_config,
+                quantization=self.config.quant_config,
                 load_model_on_cpu=
                 True,  # TODO:TRTLLM-195 to enhance the weights loading memory usage and chose best location
-                **self.convert_checkpoint_options,
+                override_fields=self.convert_checkpoint_options,
             )
 
         self.pretrained_config = self.model.config
@@ -1050,16 +1035,11 @@ class ModelLoader:
 
     def _load_model_from_ckpt(self):
         ''' Load a TRT-LLM model from checkpoint. '''
-        self.pretrained_config = PretrainedConfig.from_json_file(
+        model_config = PretrainedConfig.from_json_file(
             os.path.join(self._model_dir, 'config.json'))
-        self.pretrained_config.mapping = self.mapping
-
-        architecture = self.pretrained_config.architecture
-        assert architecture in MODEL_MAP, \
-            f"Unsupported model architecture: {architecture}"
-        model_cls = MODEL_MAP[architecture]
-        self.model = model_cls.from_checkpoint(self._model_dir,
-                                               config=self.pretrained_config)
+        model_config.mapping = self.mapping
+        self.model = load_model(model_config, self._model_dir)
+        self.pretrained_config = model_config
         self._model_info = _ModelInfo.from_pretrained_config(
             self.pretrained_config)
 

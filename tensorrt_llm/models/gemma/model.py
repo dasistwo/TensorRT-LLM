@@ -251,7 +251,7 @@ class GemmaForCausalLM(DecoderModelForCausalLM):
             'rotary_base': getattr(cfg, 'rotary_base', 10000.0),
             'rotary_scaling': getattr(cfg, 'rotary_scaling', None),
             'norm_epsilon': cfg.rms_norm_eps,
-            'quantization': quantization.to_dict(),
+            'quantization': quantization.asdict(),
             'mapping': {
                 'world_size': mapping.world_size,
                 'tp_size': mapping.world_size,

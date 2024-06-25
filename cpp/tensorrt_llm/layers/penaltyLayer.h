@@ -19,12 +19,17 @@
 
 #include <curand_kernel.h>
 
+#include "tensorrt_llm/common/tensor.h"
 #include "tensorrt_llm/executor/types.h"
 #include "tensorrt_llm/layers/baseLayer.h"
 #include "tensorrt_llm/layers/decodingParams.h"
+#include "tensorrt_llm/layers/layerUtils.h"
+#include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 
-namespace tensorrt_llm::layers
+namespace tensorrt_llm
+{
+namespace layers
 {
 
 //! \brief Layer applies penalties to the logits. Supports:
@@ -43,11 +48,10 @@ public:
     ~PenaltyLayer() override;
 
     void setup(runtime::SizeType32 batchSize, runtime::SizeType32 beamWidth, runtime::SizeType32 const* batchSlots,
-        std::shared_ptr<BaseSetupParams> const& setupParams) override;
+        std::shared_ptr<BaseSetupParams> setupParams) override;
 
     //! \brief Modifies 'outputs->logits' in-place with -INF for banned words
-    void forwardAsync(std::shared_ptr<BaseDecodingOutputs> const& outputs,
-        std::shared_ptr<BaseDecodingInputs> const& inputs) override;
+    void forwardAsync(std::shared_ptr<BaseOutputParams> outputs, std::shared_ptr<BaseInputParams> inputs) override;
 
     T* getRuntimeLogitsDevice()
     {
@@ -99,4 +103,5 @@ private:
     runtime::ITensor::SharedPtr mLogitsPtrsHost;
 };
 
-} // namespace tensorrt_llm::layers
+} // namespace layers
+} // namespace tensorrt_llm

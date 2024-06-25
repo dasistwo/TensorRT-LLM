@@ -137,15 +137,6 @@ def parse_arguments():
         ('If this option is specified, it will override the max output len of '
          'TRT engines to the specified value instead of using pre-defined one'))
     parser.add_argument(
-        '--max_seq_len',
-        '--max_decoder_seq_len',
-        dest='max_seq_len',
-        type=int,
-        default=None,
-        help=
-        ('If this option is specified, it will override the max sequence len of '
-         'TRT engines to the specified value instead of using pre-defined one'))
-    parser.add_argument(
         '--max_batch_size',
         type=int,
         default=None,
@@ -160,6 +151,10 @@ def parse_arguments():
                         default=False,
                         action='store_true',
                         help="Build engines serially")
+    parser.add_argument('--strongly_typed',
+                        default=False,
+                        action='store_true',
+                        help='This option will reduce the building time.')
     parser.add_argument(
         '--multiple_profiles',
         default=False,
@@ -256,6 +251,9 @@ def build_gpt(args):
     if not args.serial_build:
         torch.cuda.set_device(runtime_rank)
 
+    strongly_typed = args.strongly_typed
+    if args.quantization is not None and "fp8" in args.quantization:
+        strongly_typed = True
     num_kv_heads = build_config['num_heads'] \
         if build_config['num_kv_heads'] is None else build_config['num_kv_heads']
     apply_query_key_layer_scaling = False
@@ -263,24 +261,8 @@ def build_gpt(args):
         if args.max_batch_size is None else args.max_batch_size
     max_input_len = build_config['max_input_len'] \
         if args.max_input_len is None else args.max_input_len
-
-    if args.max_output_len:
-        logger.warning(
-            '--max_output_len has been deprecated in favor of --max_seq_len')
-        if args.max_input_len:
-            if args.max_seq_len:
-                logger.warning(
-                    '--max_seq_len has been overwritten due to --max_output_len being specified'
-                )
-            args.max_seq_len = args.max_input_len + args.max_output_len
-        else:
-            raise Exception(
-                f"max_output_len is specified but not max_input_len")
-
-        del args.max_output_len
-
-    max_seq_len = build_config['max_seq_len'] \
-        if args.max_seq_len is None else args.max_seq_len
+    max_output_len = build_config['max_output_len'] \
+        if args.max_output_len is None else args.max_output_len
     max_beam_width = build_config['max_beam_width'] \
         if args.max_beam_width is None else args.max_beam_width
 
@@ -298,7 +280,7 @@ def build_gpt(args):
         raise Exception(
             f'--opt_num_tokens does not support ootb mode. Please using --opt_batch_size instead it.'
         )
-    max_num_tokens = max_batch_size * max(max_input_len, max_beam_width)
+
     quant_config = get_quant_config(args.quantization)
     quant_algo = quant_config.quant_algo
     kv_cache_quant_algo = quant_config.kv_cache_quant_algo
@@ -333,14 +315,13 @@ def build_gpt(args):
         max_batch_size=max_batch_size,
         max_beam_width=max_beam_width,
         max_input_len=max_input_len,
-        max_seq_len=max_seq_len,
-        max_num_tokens=max_num_tokens,
+        max_output_len=max_output_len,
         int8=(quant_mode.has_act_and_weight_quant()
               or quant_mode.is_int8_weight_only()),
         quant_mode=quant_mode,
         use_refit=False,
         opt_level=build_config['builder_opt'],
-        strongly_typed=True,
+        strongly_typed=strongly_typed,
         weight_streaming=is_weight_streaming,
         **builder_config_extra_kwargs)
     engine_name = get_engine_name(args.model, args.dtype, world_size,
@@ -382,10 +363,8 @@ def build_gpt(args):
             'apply_query_key_layer_scaling':
             builder_config.apply_query_key_layer_scaling,
             'rotary_pct': build_config['rotary_pct'],
-            'moe': {
-                'num_experts': build_config["moe_num_experts"],
-                'top_k': build_config["moe_top_k"],
-            },
+            'moe_num_experts': build_config["moe_num_experts"],
+            'moe_top_k': build_config["moe_top_k"],
         }
         config = PretrainedConfig.from_dict(config)
         tensorrt_llm_model = tensorrt_llm.models.GPTForCausalLM(config)
@@ -420,7 +399,7 @@ def build_gpt(args):
     elif family == "llama":
         config = {
             'architecture':
-            'LlamaForCausalLM',
+            'LLaMAForCausalLM',
             'dtype':
             args.dtype,
             'num_hidden_layers':
@@ -451,10 +430,10 @@ def build_gpt(args):
                 'world_size': world_size,
                 'tp_size': world_size
             },
-            'moe': {
-                'num_experts': build_config["moe_num_experts"],
-                'top_k': build_config["moe_top_k"],
-            }
+            'moe_num_experts':
+            build_config["moe_num_experts"],
+            'moe_top_k':
+            build_config["moe_top_k"],
         }
         config = PretrainedConfig.from_dict(config)
         tensorrt_llm_model = tensorrt_llm.models.LLaMAForCausalLM(config)
@@ -598,39 +577,6 @@ def build_gpt(args):
         config = PretrainedConfig.from_dict(config)
         tensorrt_llm_model = tensorrt_llm.models.ChatGLMForCausalLM(config)
 
-    elif family == "glm":
-        config = {
-            'architecture': 'ChatGLMForCausalLM',
-            'dtype': args.dtype,
-            'num_hidden_layers': build_config['num_layers'],
-            'num_attention_heads': build_config['num_heads'],
-            'num_key_value_heads': build_config['num_kv_heads'],
-            'hidden_size': build_config['hidden_size'],
-            'intermediate_size': build_config['inter_size'],
-            'norm_epsilon': 1e-5,
-            'vocab_size': build_config['vocab_size'],
-            'position_embedding_type': 'learned_absolute',
-            'max_position_embeddings': build_config['n_positions'],
-            'hidden_act': build_config['hidden_act'],
-            'quantization': {
-                'quant_algo': quant_algo,
-                'kv_cache_quant_algo': kv_cache_quant_algo
-            },
-            'mapping': {
-                'world_size': world_size,
-                'tp_size': world_size
-            },
-            'chatglm_version': 'glm',
-            'add_bias_linear': True,
-            'add_qkv_bias': True,
-            'apply_query_key_layer_scaling': False,
-            'apply_residual_connection_post_layernorm': False,
-            'rmsnorm': False,
-            'rope_ratio': 1.0,
-        }
-        config = PretrainedConfig.from_dict(config)
-        tensorrt_llm_model = tensorrt_llm.models.ChatGLMForCausalLM(config)
-
     elif family == "bloom":
         config = {
             'architecture': 'BloomForCausalLM',
@@ -656,6 +602,9 @@ def build_gpt(args):
         }
         config = PretrainedConfig.from_dict(config)
         tensorrt_llm_model = tensorrt_llm.models.BloomForCausalLM(config)
+        tensorrt_llm_model = optimize_model(
+            tensorrt_llm_model,
+            use_parallel_embedding=config.use_parallel_embedding)
     elif family == "falcon":
         config = {
             'architecture':
@@ -700,6 +649,7 @@ def build_gpt(args):
             config['quantization'].update({
                 'has_zero_point': False,
                 'pre_quant_scale': True,
+                'exclude_modules': [],
             })
         config = PretrainedConfig.from_dict(config)
         tensorrt_llm_model = tensorrt_llm.models.FalconForCausalLM(config)
@@ -746,7 +696,7 @@ def build_gpt(args):
     elif family == "internlm":
         config = {
             'architecture':
-            'LlamaForCausalLM',
+            'LLaMAForCausalLM',
             'dtype':
             args.dtype,
             'num_hidden_layers':
@@ -783,6 +733,7 @@ def build_gpt(args):
                     "group_size": 128,
                     "has_zero_point": False,
                     "pre_quant_scale": True,
+                    "exclude_modules": [],
                 })
             elif 'gptq' in args.quantization:
                 config['quantization'].update({
@@ -827,10 +778,10 @@ def build_gpt(args):
                 'world_size': world_size,
                 'tp_size': world_size
             },
-            'moe': {
-                'num_experts': build_config["moe_num_experts"],
-                'top_k': build_config["moe_top_k"],
-            },
+            'moe_num_experts':
+            build_config["moe_num_experts"],
+            'moe_top_k':
+            build_config["moe_top_k"],
             'qwen_type':
             'qwen',
         }
@@ -870,10 +821,10 @@ def build_gpt(args):
                 'world_size': world_size,
                 'tp_size': world_size
             },
-            'moe': {
-                'num_experts': build_config["moe_num_experts"],
-                'top_k': build_config["moe_top_k"],
-            },
+            'moe_num_experts':
+            build_config["moe_num_experts"],
+            'moe_top_k':
+            build_config["moe_top_k"],
             'qwen_type':
             'qwen2',
         }
@@ -928,7 +879,6 @@ def build_gpt(args):
             'layer_types': build_config['layer_types'],
             'rnn_hidden_size': build_config['rnn_hidden_size'],
             'logits_soft_cap': build_config['logits_soft_cap'],
-            'rotary_pct': build_config['rotary_pct'],
         }
         config = PretrainedConfig.from_dict(config)
         tensorrt_llm_model = tensorrt_llm.models.RecurrentGemmaForCausalLM(
@@ -991,15 +941,12 @@ def build_gpt(args):
 
         # Forward
         print(
-            f"max_batch_size: {max_batch_size}, max_input_len: {max_input_len}, max_seq_len: {max_seq_len}, max_beam_width: {max_beam_width}"
+            f"max_batch_size: {max_batch_size}, max_input_len: {max_input_len}, max_output_len: {max_output_len}, max_beam_width: {max_beam_width}"
         )
-        # NOTE: all other models use PretrainedModel.prepare_inputs(...)
-        # except RecurrentGemmaForCausalLM and MambaForCausalLM
         inputs = tensorrt_llm_model.prepare_inputs(
             max_batch_size=max_batch_size,
             max_input_len=max_input_len,
-            max_seq_len=max_seq_len,
-            max_num_tokens=max_num_tokens,
+            max_seq_len=max_input_len + max_output_len,
             use_cache=True,
             max_beam_width=max_beam_width,
             opt_batch_size=opt_batch_size,
@@ -1082,7 +1029,7 @@ def build_bert(args):
         max_batch_size=max_batch_size,
         max_input_len=max_input_len,
         opt_level=build_config['builder_opt'],
-        strongly_typed=True,
+        strongly_typed=args.strongly_typed,
         weight_streaming=is_weight_streaming,
     )
     engine_name = get_engine_name(args.model, args.dtype, world_size,
@@ -1254,13 +1201,13 @@ def enc_dec_build_helper(component, config, args):
         max_batch_size=config['max_batch_size'],
         max_beam_width=config['max_beam_width'],
         max_decoder_input_len=config['max_decoder_input_len'],
-        max_seq_len=config['max_seq_len'],
+        max_output_len=config['max_output_len'],
         max_encoder_input_len=config['max_encoder_input_len'],
         opt_level=config['builder_opt'],
         cross_attention=(component == 'decoder'),
         has_position_embedding=has_position_embedding,
         has_token_type_embedding=False,  # by default
-        strongly_typed=True,
+        strongly_typed=False,  # by default
         gather_all_token_logits=False,  # by default
         int8=(quant_mode.has_act_and_weight_quant()
               or quant_mode.is_int8_weight_only()),
@@ -1354,7 +1301,7 @@ def enc_dec_build_helper(component, config, args):
                 has_embedding_layernorm,
                 'has_embedding_scale':
                 config.get('has_embedding_scale', False),
-                'intermediate_size':
+                'ffn_hidden_size':
                 config['ffn_hidden_size'],
                 'q_scaling':
                 q_scaling,
@@ -1419,7 +1366,7 @@ def enc_dec_build_helper(component, config, args):
             has_embedding_layernorm,
             'has_embedding_scale':
             config.get('has_embedding_scale', False),
-            'intermediate_size':
+            'ffn_hidden_size':
             config['ffn_hidden_size'],
             'q_scaling':
             q_scaling,
@@ -1442,15 +1389,11 @@ def enc_dec_build_helper(component, config, args):
             'encoder_head_size':
             config['head_size'],
             'skip_cross_qkv':
-            config['skip_cross_qkv'],
-            'use_implicit_relative_attention':
-            config['use_implicit_relative_attention']
+            config['skip_cross_qkv']
         })
         tllm_model = tensorrt_llm.models.DecoderModel(pretrained_config)
         if use_weight_only and family == 'whisper':
             tllm_model = quantize(tllm_model, quant_config)
-
-    tllm_model.precompute_relative_attention_bias(builder_config)
 
     # Module -> Network
     engine_name = get_engine_name(args.model, args.dtype, world_size,
@@ -1483,7 +1426,7 @@ def enc_dec_build_helper(component, config, args):
             if family == 'whisper':
                 inputs = tllm_model.prepare_inputs(
                     max_batch_size=config['max_batch_size'], )
-                tllm_model(**inputs)
+                tllm_model(*inputs)
             else:
                 inputs = tllm_model.prepare_inputs(
                     max_batch_size=config['max_batch_size'],
@@ -1496,7 +1439,7 @@ def enc_dec_build_helper(component, config, args):
                     max_batch_size=config['max_batch_size'],
                     max_beam_width=config['max_beam_width'],
                     max_decoder_input_len=config['max_decoder_input_len'],
-                    max_seq_len=config['max_seq_len'],
+                    max_seq_len=config['max_output_len'],
                     max_encoder_input_len=1500,  # n_audio_ctx
                 )
                 tllm_model(**inputs)
@@ -1505,7 +1448,7 @@ def enc_dec_build_helper(component, config, args):
                     max_batch_size=config['max_batch_size'],
                     max_beam_width=config['max_beam_width'],
                     max_decoder_input_len=config['max_decoder_input_len'],
-                    max_seq_len=config['max_seq_len'],
+                    max_seq_len=config['max_output_len'],
                     max_encoder_input_len=config['max_encoder_input_len'],
                 )
 
@@ -1571,24 +1514,8 @@ def build_enc_dec(args):
     build_config['max_encoder_input_len'] = build_config['max_encoder_input_len'] \
         if args.max_input_len is None else args.max_input_len
     build_config['max_decoder_input_len'] = 1
-
-    if args.max_output_len:
-        logger.warning(
-            '--max_output_len has been deprecated in favor of --max_seq_len')
-        if args.max_input_len:
-            if args.max_seq_len:
-                logger.warning(
-                    '--max_seq_len has been overwritten due to --max_output_len being specified'
-                )
-            args.max_seq_len = args.max_input_len + args.max_output_len
-        else:
-            raise Exception(
-                f"max_output_len is specified but not max_input_len")
-
-        del args.max_output_len
-
-    build_config['max_seq_len'] = build_config['max_seq_len'] \
-        if args.max_seq_len is None else args.max_seq_len
+    build_config['max_output_len'] = build_config['max_output_len'] \
+        if args.max_output_len is None else args.max_output_len
     build_config[
         'max_beam_width'] = 1 if args.max_beam_width is None else args.max_beam_width
 

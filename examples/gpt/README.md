@@ -198,7 +198,7 @@ trtllm-build --model_config gpt_530b/trt_ckpt/fp16/16-gpu/config.json \
         --gemm_plugin auto \
         --max_batch_size 128 \
         --max_input_len 128 \
-        --max_seq_len 148 \
+        --max_output_len 20 \
         --output_dir gpt_530b/trt_engines/fp16/16-gpu \
         --workers 8
 ```
@@ -428,6 +428,7 @@ python3 convert_checkpoint.py --model_dir gpt2 \
         --output_dir gpt2/trt_ckpt/int8kv/1-gpu
 
 trtllm-build --checkpoint_dir gpt2/trt_ckpt/int8kv/1-gpu \
+        --strongly_typed \
         --output_dir gpt2/trt_engines/int8kv/1-gpu
 ```
 
@@ -698,7 +699,7 @@ trtllm-build --checkpoint_dir gpt-next-2B/trt_ckpt/fp16/1-gpu \
         --max_batch_size 4 \
         --max_beam_width 2 \
         --max_input_len 512 \
-        --max_seq_len 562 \
+        --max_output_len 50 \
         --output_dir gpt-next-2B/trt_engines/fp16/1-gpu
 
 # Run inference directly from NeMo LoRA checkpoint

@@ -120,13 +120,15 @@ class RgLru(Module):
                  num_heads=1,
                  dtype=None,
                  tp_group=None,
-                 tp_size=1):
+                 tp_size=1,
+                 tp_rank=0):
         super().__init__()
         self.lru_width = lru_width
         self.dtype = dtype
         self.num_heads = num_heads
         self.tp_group = tp_group
         self.tp_size = tp_size
+        self.tp_rank = tp_rank
 
         self.recurrent_param = Parameter(shape=(self.lru_width //
                                                 self.tp_size, ),
@@ -182,7 +184,8 @@ class FusedRgLru(Module):
                  num_heads=1,
                  dtype=None,
                  tp_group=None,
-                 tp_size=1):
+                 tp_size=1,
+                 tp_rank=0):
         super().__init__()
         self.lru_width = lru_width
         self.tp_size = tp_size
@@ -237,6 +240,7 @@ class Recurrent(Module):
         dtype=None,
         tp_group=None,
         tp_size=1,
+        tp_rank=0,
     ):
         super().__init__()
         self.width = width
@@ -269,7 +273,8 @@ class Recurrent(Module):
                             num_heads=num_heads,
                             dtype=dtype,
                             tp_group=tp_group,
-                            tp_size=tp_size)
+                            tp_size=tp_size,
+                            tp_rank=tp_rank)
 
         self.linear_out = RowLinear(self.lru_width,
                                     self.width,

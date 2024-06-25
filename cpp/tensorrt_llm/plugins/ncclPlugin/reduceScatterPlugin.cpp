@@ -101,9 +101,8 @@ int ReduceScatterPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
         size *= outputDesc[0].dims.d[i];
     }
 
-    TLLM_CHECK_WITH_INFO(mNcclComm.get() != nullptr, "mNcclComm should be initialized before used");
     NCCLCHECK(ncclReduceScatter(
-        inputs[0], outputs[0], size, (*getDtypeMap())[inputDesc[0].type], ncclSum, *mNcclComm, stream));
+        inputs[0], outputs[0], size, (*getDtypeMap())[inputDesc[0].type], ncclSum, (*getCommMap())[mGroup], stream));
 
     return 0;
 }
@@ -135,15 +134,21 @@ int ReduceScatterPlugin::getNbOutputs() const noexcept
 
 int ReduceScatterPlugin::initialize() noexcept
 {
-    if (isBuilding())
-    {
-        return 0;
-    }
-    mNcclComm = getComm(mGroup);
+    initCommMap(mGroup);
     return 0;
 }
 
-void ReduceScatterPlugin::terminate() noexcept {}
+void ReduceScatterPlugin::terminate() noexcept
+{
+    auto* commMap = getCommMap();
+    // [] operator inserts T() if it does not exist
+    if (isBuilding() || (*commMap)[mGroup] == nullptr)
+    {
+        return;
+    }
+    NCCLCHECK(ncclCommDestroy((*commMap)[mGroup]));
+    (*commMap)[mGroup] = nullptr;
+}
 
 size_t ReduceScatterPlugin::getSerializationSize() const noexcept
 {

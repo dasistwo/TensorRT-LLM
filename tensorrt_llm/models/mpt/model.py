@@ -38,7 +38,6 @@ class MPTDecoderLayer(Module):
 
         self.input_layernorm = LayerNorm(normalized_shape=hidden_size,
                                          eps=layernorm_epsilon,
-                                         bias=False,
                                          dtype=dtype)
 
         layers_range = config.mapping.pp_layers(config.num_hidden_layers)
@@ -70,7 +69,6 @@ class MPTDecoderLayer(Module):
 
         self.post_layernorm = LayerNorm(normalized_shape=hidden_size,
                                         eps=layernorm_epsilon,
-                                        bias=False,
                                         dtype=dtype)
 
     def forward(self,
@@ -122,7 +120,6 @@ class MPTModel(Module):
         self.layers = DecoderLayerList(MPTDecoderLayer, config)
         if config.mapping.is_last_pp_rank():
             self.ln_f = LayerNorm(normalized_shape=config.hidden_size,
-                                  bias=False,
                                   dtype=config.dtype)
 
     def forward(self,

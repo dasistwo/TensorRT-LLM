@@ -1,18 +1,3 @@
-/*
- * Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
 #include <gtest/gtest.h>
 
 #include "tensorrt_llm/common/tensorConversion.h"
@@ -172,7 +157,7 @@ TEST(LookaheadRandomllm, gpuSampling)
     // Init logits randomly
     for (SizeType32 bi = 0; bi < batchSize; bi++)
     {
-        TensorPtr one = ITensor::at(mProbs, {bi});
+        TensorPtr one = squeezed(ITensor::slice(mProbs, bi, 1));
         mAscii->stringToLogits(one, text[bi]);
         auto result = mAscii->logitsToString(one);
         EXPECT_EQ(result, text[bi]);
@@ -212,9 +197,9 @@ TEST(LookaheadRandomllm, gpuSampling)
     kernelParams.returnAllTopK = false;
 
     PRINT_TOKENS(mEndIds);
-    PRINT_VALUES(mTokensPerStep);
-    PRINT_VALUES(mBatchSlots);
-    PRINT_VALUES(mTopKs);
+    PRINT_TENSOR(mTokensPerStep);
+    PRINT_TENSOR(mBatchSlots);
+    PRINT_TENSOR(mTopKs);
     tensorrt_llm::kernels::invokeBatchTopKSampling(kernelParams, mStream->get());
 
     mStream->synchronize();
@@ -231,7 +216,7 @@ TEST(LookaheadRandomllm, gpuSampling)
     {
         SizeType32 gbi = kernelParams.batchSlots[bi];
         bool finished = kernelParams.finishedOutput[bi].isFinished();
-        TensorPtr one = ITensor::at(mOutputIds, {gbi});
+        TensorPtr one = squeezed(ITensor::slice(mOutputIds, gbi, 1));
         auto oneRange = BufferRange<TokenIdType>(*one);
         std::vector<char> result(mMaxSeqLen, '\0');
         std::copy(oneRange.begin(), oneRange.end(), result.begin());

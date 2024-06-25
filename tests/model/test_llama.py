@@ -29,10 +29,9 @@ from transformers import LlamaConfig, LlamaForCausalLM
 import tensorrt_llm
 from tensorrt_llm import Builder
 from tensorrt_llm._utils import str_dtype_to_trt, trt_dtype_to_str
-from tensorrt_llm.models import PretrainedConfig
-from tensorrt_llm.models.llama.convert import (load_weights_from_hf_model,
-                                               load_weights_from_meta_ckpt)
-from tensorrt_llm.models.modeling_utils import optimize_model
+from tensorrt_llm.models.llama.weight import (load_from_hf_llama,
+                                              load_from_meta_llama)
+from tensorrt_llm.models.modeling_utils import PretrainedConfig, optimize_model
 from tensorrt_llm.network import net_guard
 from tensorrt_llm.plugin.plugin import ContextFMHAType
 
@@ -74,20 +73,31 @@ class TestLLaMA(unittest.TestCase):
                 'mapping': {
                     'world_size': tensor_parallel,
                     'tp_size': tensor_parallel,
-                    'rank': rank,
                 },
-                "moe": {
+                "moe_config": {
                     "num_experts": 0,
+                    "top_k": 0,
+                    "tp_mode": 2,
                     "normalization_mode": 1
                 },
                 'use_parallel_embedding': False,
                 'embedding_sharding_dim': 0,
+                'moe_num_experts': 0,
+                'moe_top_k': 0,
+                'moe_tp_mode': 2,
+                'moe_normalization_mode': 1,
             }
 
             # Initialize model
-            config = tensorrt_llm.models.LLaMAConfig.from_dict(config)
-            tensorrt_llm_llama = tensorrt_llm.models.LLaMAForCausalLM(config)
-            weights = load_weights_from_hf_model(hf_llama, config)
+            tensorrt_llm_llama = tensorrt_llm.models.LLaMAForCausalLM(
+                PretrainedConfig.from_dict(config))
+            weights = load_from_hf_llama(tensorrt_llm_llama,
+                                         hf_llama,
+                                         dtype=dtype,
+                                         mapping=tensorrt_llm.Mapping(
+                                             world_size=tensor_parallel,
+                                             rank=rank,
+                                             tp_size=tensor_parallel))
             tensorrt_llm_llama.load(weights)
             optimize_model(tensorrt_llm_llama, **opt_flags)
 
@@ -97,7 +107,6 @@ class TestLLaMA(unittest.TestCase):
                 max_batch_size=batch_size,
                 max_input_len=input_len,
                 max_seq_len=input_len + output_len,
-                max_num_tokens=batch_size * input_len,
                 use_cache=True,
                 max_beam_width=beam_width)
             # Forward
@@ -132,7 +141,7 @@ class TestLLaMA(unittest.TestCase):
                 timing_cache='model.cache',
                 tensor_parallel=world_size,  # TP only
                 use_refit=use_refit,
-                strongly_typed=True,
+                strongly_typed=(dtype in ["float16", "bfloat16"]),
             )
             network = builder.create_network()
             network.plugin_config.to_legacy_setting()
@@ -499,6 +508,7 @@ class TestLLaMA(unittest.TestCase):
 
         tp_size = tp_info[0]
         rank = tp_info[1]
+        dtype = "float16"
         use_parallel_embedding = (emb_sharding_dim >= 0)
         embedding_sharding_dim = abs(emb_sharding_dim)
         hf_llama = LlamaForCausalLM.from_pretrained(
@@ -530,28 +540,48 @@ class TestLLaMA(unittest.TestCase):
             'mapping': {
                 'world_size': tp_size,
                 'tp_size': tp_size,
-                'rank': rank,
             },
-            "moe": {
+            "moe_config": {
                 "num_experts": 0,
                 "top_k": 0,
-                "normalization_mode": 1,
+                "tp_mode": 2,
+                "normalization_mode": 1
             },
             'use_parallel_embedding': use_parallel_embedding,
             'embedding_sharding_dim': embedding_sharding_dim,
+            'moe_num_experts': 0,
+            'moe_top_k': 0,
+            'moe_tp_mode': 1,
+            'moe_normalization_mode': 1,
             'use_fused_mlp': False,
         }
-
-        config = PretrainedConfig.from_dict(config)
-        tensorrt_llm_llama_wHF = tensorrt_llm.models.LLaMAForCausalLM(config)
+        cfg = PretrainedConfig.from_dict(config)
+        tensorrt_llm_llama_wHF = tensorrt_llm.models.LLaMAForCausalLM(cfg)
+        tensorrt_llm_llama_wHF = optimize_model(
+            tensorrt_llm_llama_wHF,
+            use_parallel_embedding=use_parallel_embedding)
         # print_layers(tensorrt_llm_llama_wHF)
-        weights_wHF = load_weights_from_hf_model(hf_llama, config)
+        weights_wHF = load_from_hf_llama(tensorrt_llm_llama_wHF,
+                                         hf_llama,
+                                         mapping=tensorrt_llm.Mapping(
+                                             world_size=tp_size,
+                                             rank=rank,
+                                             tp_size=tp_size),
+                                         dtype=dtype)
         tensorrt_llm_llama_wHF.load(weights_wHF)
         # print_layers(tensorrt_llm_llama_wHF)
 
-        tensorrt_llm_llama_wMETA = tensorrt_llm.models.LLaMAForCausalLM(config)
+        tensorrt_llm_llama_wMETA = tensorrt_llm.models.LLaMAForCausalLM(cfg)
+        tensorrt_llm_llama_wMETA = optimize_model(
+            tensorrt_llm_llama_wMETA,
+            use_parallel_embedding=use_parallel_embedding)
         # print_layers(tensorrt_llm_llama_wMETA)
-        weights_wMETA = load_weights_from_meta_ckpt(meta_path, config)
+        weights_wMETA = load_from_meta_llama(meta_path,
+                                             mapping=tensorrt_llm.Mapping(
+                                                 world_size=tp_size,
+                                                 rank=rank,
+                                                 tp_size=tp_size),
+                                             config=cfg)
         tensorrt_llm_llama_wMETA.load(weights_wMETA)
         # print_layers(tensorrt_llm_llama_wMETA)
         # token embedding

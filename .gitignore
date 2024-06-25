@@ -6,7 +6,6 @@ __pycache__/
 *.nsys-rep
 .VSCodeCounter
 build*/
-!builders/
 *.egg-info/
 .coverage
 *.onnx

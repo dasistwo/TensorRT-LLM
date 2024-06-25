@@ -42,17 +42,15 @@ public:
         tensorrt_llm::kernels::PositionEmbeddingType position_embedding_type,
         int rotary_embedding_dim, // for RoPE. Use 0 for non-RoPE
         float rotary_embedding_base, tensorrt_llm::kernels::RotaryScalingType rotary_embedding_scale_type,
-        float rotary_embedding_scale, float rotary_embedding_short_m_scale, float rotary_embedding_long_m_scale,
-        int rotary_embedding_max_positions, int rotary_embedding_original_max_positions, int tp_size,
+        float rotary_embedding_scale, float rotary_embedding_m_scale, int rotary_embedding_max_positions, int tp_size,
         int tp_rank,          // for ALiBi
         bool unfuse_qkv_gemm, // for AutoPP
         tensorrt_llm::kernels::ContextFMHAType context_fmha_type, bool multi_block_mode, bool enable_xqa,
         int kv_cache_quant_mode, bool remove_input_padding, tensorrt_llm::kernels::AttentionMaskType mask_type,
-        tensorrt_llm::kernels::BlockSparseParams block_sparse_params, bool paged_kv_cache, int tokens_per_block,
-        nvinfer1::DataType type, int32_t max_context_length, bool qkv_bias_enabled, bool cross_attention = false,
-        int max_distance = 0, bool pos_shift_enabled = false, bool dense_context_fmha = false,
-        bool use_paged_context_fmha = false, bool use_fp8_context_fmha = false, bool use_cache = true,
-        bool is_spec_decoding_enabled = false);
+        bool paged_kv_cache, int tokens_per_block, nvinfer1::DataType type, int32_t max_context_length,
+        bool qkv_bias_enabled, bool cross_attention = false, int max_distance = 0, bool pos_shift_enabled = false,
+        bool dense_context_fmha = false, bool use_paged_context_fmha = false, bool use_fp8_context_fmha = false,
+        bool use_cache = true, bool is_spec_decoding_enabled = false);
 
     GPTAttentionPluginCommon(void const* data, size_t length);
 
@@ -84,10 +82,10 @@ public:
 protected:
     int getMaxNumSeqLenTile(int batch_beam_size = 1) const;
     size_t getWorkspaceSizeForContext(nvinfer1::DataType type, int32_t nbReq, int32_t max_input_length,
-        int32_t cross_qkv_length = 0, int32_t max_num_tokens = 0) const noexcept;
+        int32_t max_kv_cache_len, int32_t cross_qkv_length = 0, int32_t max_num_tokens = 0) const noexcept;
     // total_num_seq is the sum of beam_width for multiple requests
-    size_t getWorkspaceSizeForGeneration(nvinfer1::DataType type, int32_t total_num_seq, int32_t max_kv_cache_length,
-        int32_t max_num_tokens) const noexcept;
+    size_t getWorkspaceSizeForGeneration(
+        nvinfer1::DataType type, int32_t total_num_seq, int32_t max_kv_cache_length) const noexcept;
 
     template <typename T, typename KVCacheBuffer>
     struct EnqueueContextParams
@@ -224,7 +222,6 @@ protected:
         int32_t const* spec_decoding_packed_mask = nullptr;
         int32_t const* spec_decoding_position_offsets = nullptr;
         int32_t const* spec_decoding_generation_lengths = nullptr;
-        int32_t total_num_input_tokens;
     };
 
     template <typename T, typename KVCacheBuffer>
@@ -298,15 +295,11 @@ protected:
     float mRotaryEmbeddingBase;
     tensorrt_llm::kernels::RotaryScalingType mRotaryEmbeddingScaleType;
     float mRotaryEmbeddingScale;
-    float mRotaryEmbeddingShortMscale;
-    float mRotaryEmbeddingLongMscale;
+    float mRotaryEmbeddingMscale;
     int mRotaryEmbeddingMaxPositions;
-    int mRotaryEmbeddingOriginalMaxPositions;
     tensorrt_llm::kernels::PositionEmbeddingType mPositionEmbeddingType;
     bool mRemovePadding = false;
     tensorrt_llm::kernels::AttentionMaskType mMaskType;
-    tensorrt_llm::kernels::BlockSparseParams mBlockSparseParams;
-
     // NOTE: default values for paged kv cache.
     bool mPagedKVCache = false;
     int mTokensPerBlock = 0;
@@ -339,6 +332,7 @@ protected:
     // The default copy constructor will leave it as nullptr. clone() shall initialize it.
     std::shared_ptr<CUDADriverWrapper> mDriver;
     UniqPtrWNullCopy<tensorrt_llm::kernels::MHARunner> mFMHARunner;
+    tensorrt_llm::kernels::DecoderXQARunner::Resource mDecoderXQARunnerResource;
     UniqPtrWNullCopy<tensorrt_llm::kernels::DecoderXQARunner> mDecoderXQARunner;
 
     bool mMultiBlockMode;

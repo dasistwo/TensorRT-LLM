@@ -12,20 +12,17 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import os
-import sys
 import unittest
 
+import numpy as np
 import torch
+from polygraphy.backend.trt import EngineFromNetwork, TrtRunner
 
 import tensorrt_llm
 from tensorrt_llm import Tensor
 
-sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-from utils.util import create_session, run_session
 
-
-class TestInterpolate(unittest.TestCase):
+class TestFunctional(unittest.TestCase):
 
     def setUp(self):
         tensorrt_llm.logger.set_level('error')
@@ -37,17 +34,15 @@ class TestInterpolate(unittest.TestCase):
         output_shape = (16, 24, 32)
 
         input_data = torch.rand(
-            input_shape,
-            dtype=tensorrt_llm._utils.str_dtype_to_torch(dtype),
-            device="cuda")
+            input_shape, dtype=tensorrt_llm._utils.str_dtype_to_torch(dtype))
         mode = 'nearest'
         # construct trt network
         align_corners_flag = False
 
         builder = tensorrt_llm.Builder()
-        network = builder.create_network()
-        with tensorrt_llm.net_guard(network):
-
+        net = builder.create_network()
+        with tensorrt_llm.net_guard(net):
+            network = tensorrt_llm.default_trtnet()
             input = Tensor(name='input',
                            shape=input_shape,
                            dtype=tensorrt_llm.str_dtype_to_trt(dtype))
@@ -56,23 +51,20 @@ class TestInterpolate(unittest.TestCase):
                 size=output_shape,
                 mode=mode,
                 align_corners=align_corners_flag,
-            )
-            output.mark_output('output')
+            ).trt_tensor
+            output.name = 'output'
+            network.mark_output(output)
 
         # trt run
-        session = create_session(builder, network, precision=dtype)
-        inputs = {
-            'input': input_data,
-        }
-        outputs = run_session(session, inputs)
+        build_engine = EngineFromNetwork((builder.trt_builder, net.trt_network))
+        with TrtRunner(build_engine) as runner:
+            outputs = runner.infer(feed_dict={'input': input_data.numpy()})
 
-        # pytorch run
         ref = torch.nn.functional.interpolate(input_data,
                                               size=output_shape,
                                               mode=mode)
 
-        # compare diff
-        torch.testing.assert_close(ref, outputs['output'])
+        np.testing.assert_allclose(ref.cpu().numpy(), outputs['output'])
 
     def test_interpolate_without_scales_bilinear_4d_disable_align_corner(self):
         # test data
@@ -81,17 +73,15 @@ class TestInterpolate(unittest.TestCase):
         output_shape = (16, 24)
 
         input_data = torch.rand(
-            input_shape,
-            dtype=tensorrt_llm._utils.str_dtype_to_torch(dtype),
-            device="cuda")
+            input_shape, dtype=tensorrt_llm._utils.str_dtype_to_torch(dtype))
         mode = 'bilinear'
         # construct trt network
         align_corners_flag = False
 
         builder = tensorrt_llm.Builder()
-        network = builder.create_network()
-        with tensorrt_llm.net_guard(network):
-
+        net = builder.create_network()
+        with tensorrt_llm.net_guard(net):
+            network = tensorrt_llm.default_trtnet()
             input = Tensor(name='input',
                            shape=input_shape,
                            dtype=tensorrt_llm.str_dtype_to_trt(dtype))
@@ -100,23 +90,22 @@ class TestInterpolate(unittest.TestCase):
                 size=output_shape,
                 mode=mode,
                 align_corners=align_corners_flag,
-            )
-            output.mark_output('output')
+            ).trt_tensor
+            output.name = 'output'
+            network.mark_output(output)
 
         # trt run
-        session = create_session(builder, network, precision=dtype)
-        inputs = {
-            'input': input_data,
-        }
-        outputs = run_session(session, inputs)
+        build_engine = EngineFromNetwork((builder.trt_builder, net.trt_network))
+        with TrtRunner(build_engine) as runner:
+            outputs = runner.infer(feed_dict={'input': input_data.numpy()})
 
-        # pytorch run
         ref = torch.nn.functional.interpolate(input_data,
                                               size=output_shape,
                                               mode=mode)
 
-        # compare diff
-        torch.testing.assert_close(ref, outputs['output'])
+        np.testing.assert_allclose(ref.cpu().numpy(),
+                                   outputs['output'],
+                                   atol=1e-5)
 
     def test_interpolate_without_scales_bilinear_4d_enable_align_corner(self):
         # test data
@@ -125,17 +114,15 @@ class TestInterpolate(unittest.TestCase):
         output_shape = (16, 24)
 
         input_data = torch.rand(
-            input_shape,
-            dtype=tensorrt_llm._utils.str_dtype_to_torch(dtype),
-            device="cuda")
+            input_shape, dtype=tensorrt_llm._utils.str_dtype_to_torch(dtype))
         mode = 'bilinear'
         # construct trt network
         align_corners_flag = True
 
         builder = tensorrt_llm.Builder()
-        network = builder.create_network()
-        with tensorrt_llm.net_guard(network):
-
+        net = builder.create_network()
+        with tensorrt_llm.net_guard(net):
+            network = tensorrt_llm.default_trtnet()
             input = Tensor(name='input',
                            shape=input_shape,
                            dtype=tensorrt_llm.str_dtype_to_trt(dtype))
@@ -144,23 +131,22 @@ class TestInterpolate(unittest.TestCase):
                 size=output_shape,
                 mode=mode,
                 align_corners=align_corners_flag,
-            )
-            output.mark_output('output')
+            ).trt_tensor
+            output.name = 'output'
+            network.mark_output(output)
 
         # trt run
-        session = create_session(builder, network, precision=dtype)
-        inputs = {
-            'input': input_data,
-        }
+        build_engine = EngineFromNetwork((builder.trt_builder, net.trt_network))
+        with TrtRunner(build_engine) as runner:
+            outputs = runner.infer(feed_dict={'input': input_data.numpy()})
 
-        outputs = run_session(session, inputs)
-
-        # pytorch run
         ref = torch.nn.functional.interpolate(input_data,
                                               size=output_shape,
                                               mode=mode)
-        # compare diff
-        torch.testing.assert_close(ref, outputs['output'])
+
+        np.testing.assert_allclose(ref.cpu().numpy(),
+                                   outputs['output'],
+                                   atol=1e-5)
 
     def test_interpolate_without_scales_bicubic_4d_enable_align_corner(self):
         # test data
@@ -169,17 +155,15 @@ class TestInterpolate(unittest.TestCase):
         output_shape = (16, 24)
 
         input_data = torch.rand(
-            input_shape,
-            dtype=tensorrt_llm._utils.str_dtype_to_torch(dtype),
-            device="cuda")
+            input_shape, dtype=tensorrt_llm._utils.str_dtype_to_torch(dtype))
         mode = 'bicubic'
         # construct trt network
         align_corners_flag = True
 
         builder = tensorrt_llm.Builder()
-        network = builder.create_network()
-        with tensorrt_llm.net_guard(network):
-
+        net = builder.create_network()
+        with tensorrt_llm.net_guard(net):
+            network = tensorrt_llm.default_trtnet()
             input = Tensor(name='input',
                            shape=input_shape,
                            dtype=tensorrt_llm.str_dtype_to_trt(dtype))
@@ -188,23 +172,22 @@ class TestInterpolate(unittest.TestCase):
                 size=output_shape,
                 mode=mode,
                 align_corners=align_corners_flag,
-            )
-            output.mark_output('output')
+            ).trt_tensor
+            output.name = 'output'
+            network.mark_output(output)
 
         # trt run
-        session = create_session(builder, network, precision=dtype)
-        inputs = {
-            'input': input_data,
-        }
+        build_engine = EngineFromNetwork((builder.trt_builder, net.trt_network))
+        with TrtRunner(build_engine) as runner:
+            outputs = runner.infer(feed_dict={'input': input_data.numpy()})
 
-        outputs = run_session(session, inputs)
-
-        # pytorch run
         ref = torch.nn.functional.interpolate(input_data,
                                               size=output_shape,
                                               mode=mode)
-        # compare diff
-        torch.testing.assert_close(ref, outputs['output'])
+
+        np.testing.assert_allclose(ref.cpu().numpy(),
+                                   outputs['output'],
+                                   atol=1e-3)
 
     def test_interpolate_with_scale_3d_nearest_exact(self):
         # test data
@@ -212,17 +195,15 @@ class TestInterpolate(unittest.TestCase):
         input_shape = (1, 4, 8, 16)
         scales_factor = (2, 4)
         input_data = torch.rand(
-            input_shape,
-            dtype=tensorrt_llm._utils.str_dtype_to_torch(dtype),
-            device="cuda")
+            input_shape, dtype=tensorrt_llm._utils.str_dtype_to_torch(dtype))
         mode = 'nearest-exact'
         # construct trt network
         align_corners_flag = False
 
         builder = tensorrt_llm.Builder()
-        network = builder.create_network()
-        with tensorrt_llm.net_guard(network):
-
+        net = builder.create_network()
+        with tensorrt_llm.net_guard(net):
+            network = tensorrt_llm.default_trtnet()
             input = Tensor(name='input',
                            shape=input_shape,
                            dtype=tensorrt_llm.str_dtype_to_trt(dtype))
@@ -231,23 +212,19 @@ class TestInterpolate(unittest.TestCase):
                 scale_factor=scales_factor,
                 mode=mode,
                 align_corners=align_corners_flag,
-            )
-            output.mark_output('output')
+            ).trt_tensor
+            output.name = 'output'
+            network.mark_output(output)
 
         # trt run
-        session = create_session(builder, network, precision=dtype)
-        inputs = {
-            'input': input_data,
-        }
+        build_engine = EngineFromNetwork((builder.trt_builder, net.trt_network))
+        with TrtRunner(build_engine) as runner:
+            outputs = runner.infer(feed_dict={'input': input_data.numpy()})
 
-        outputs = run_session(session, inputs)
-
-        # pytorch run
         ref = torch.nn.functional.interpolate(input_data,
                                               scale_factor=scales_factor,
                                               mode=mode)
-        # compare diff
-        torch.testing.assert_close(ref, outputs['output'])
+        np.testing.assert_allclose(ref.cpu().numpy(), outputs['output'])
 
     def test_interpolate_with_scale_4d_bicubic(self):
         # test data
@@ -255,17 +232,15 @@ class TestInterpolate(unittest.TestCase):
         input_shape = (1, 4, 8, 12)
         scales_factor = (2.5, 2)
         input_data = torch.rand(
-            input_shape,
-            dtype=tensorrt_llm._utils.str_dtype_to_torch(dtype),
-            device="cuda")
+            input_shape, dtype=tensorrt_llm._utils.str_dtype_to_torch(dtype))
         mode = 'bicubic'
         # construct trt network
         align_corners_flag = False
 
         builder = tensorrt_llm.Builder()
-        network = builder.create_network()
-        with tensorrt_llm.net_guard(network):
-
+        net = builder.create_network()
+        with tensorrt_llm.net_guard(net):
+            network = tensorrt_llm.default_trtnet()
             input = Tensor(name='input',
                            shape=input_shape,
                            dtype=tensorrt_llm.str_dtype_to_trt(dtype))
@@ -274,24 +249,21 @@ class TestInterpolate(unittest.TestCase):
                 scale_factor=scales_factor,
                 mode=mode,
                 align_corners=align_corners_flag,
-            )
-            output.mark_output('output')
+            ).trt_tensor
+            output.name = 'output'
+            network.mark_output(output)
 
         # trt run
-        session = create_session(builder, network, precision=dtype)
-        inputs = {
-            'input': input_data,
-        }
+        build_engine = EngineFromNetwork((builder.trt_builder, net.trt_network))
+        with TrtRunner(build_engine) as runner:
+            outputs = runner.infer(feed_dict={'input': input_data.numpy()})
 
-        outputs = run_session(session, inputs)
-
-        # pytorch run
         ref = torch.nn.functional.interpolate(input_data,
                                               scale_factor=scales_factor,
                                               mode=mode)
-
-        # compare diff
-        torch.testing.assert_close(ref, outputs['output'])
+        np.testing.assert_allclose(ref.cpu().numpy(),
+                                   outputs['output'],
+                                   atol=1e-5)
 
     def test_interpolate_with_scale_4d_bilinear(self):
         # test data
@@ -299,17 +271,15 @@ class TestInterpolate(unittest.TestCase):
         input_shape = (1, 1, 8, 32)
         scales_factor = (2.5, 4)
         input_data = torch.rand(
-            input_shape,
-            dtype=tensorrt_llm._utils.str_dtype_to_torch(dtype),
-            device="cuda")
+            input_shape, dtype=tensorrt_llm._utils.str_dtype_to_torch(dtype))
         mode = 'bilinear'
         # construct trt network
         align_corners_flag = False
 
         builder = tensorrt_llm.Builder()
-        network = builder.create_network()
-        with tensorrt_llm.net_guard(network):
-
+        net = builder.create_network()
+        with tensorrt_llm.net_guard(net):
+            network = tensorrt_llm.default_trtnet()
             input = Tensor(name='input',
                            shape=input_shape,
                            dtype=tensorrt_llm.str_dtype_to_trt(dtype))
@@ -318,25 +288,22 @@ class TestInterpolate(unittest.TestCase):
                 scale_factor=scales_factor,
                 mode=mode,
                 align_corners=align_corners_flag,
-            )
-            output.mark_output('output')
+            ).trt_tensor
+            output.name = 'output'
+            network.mark_output(output)
 
         # trt run
-        session = create_session(builder, network, precision=dtype)
-        inputs = {
-            'input': input_data,
-        }
+        build_engine = EngineFromNetwork((builder.trt_builder, net.trt_network))
+        with TrtRunner(build_engine) as runner:
+            outputs = runner.infer(feed_dict={'input': input_data.numpy()})
 
-        outputs = run_session(session, inputs)
-
-        # pytorch run
         ref = torch.nn.functional.interpolate(input_data,
                                               scale_factor=scales_factor,
                                               align_corners=align_corners_flag,
                                               mode=mode)
-
-        # compare diff
-        torch.testing.assert_close(ref, outputs['output'])
+        np.testing.assert_allclose(ref.cpu().numpy(),
+                                   outputs['output'],
+                                   atol=1e-5)
 
     def test_interpolate_with_scale_5d_trilinear_enable_align_corner(self):
         # test data
@@ -344,17 +311,15 @@ class TestInterpolate(unittest.TestCase):
         input_shape = (1, 1, 8, 16, 32)
         scales_factor = (2.5, 2, 4)
         input_data = torch.rand(
-            input_shape,
-            dtype=tensorrt_llm._utils.str_dtype_to_torch(dtype),
-            device="cuda")
+            input_shape, dtype=tensorrt_llm._utils.str_dtype_to_torch(dtype))
         mode = 'trilinear'
         # construct trt network
         align_corners_flag = True
 
         builder = tensorrt_llm.Builder()
-        network = builder.create_network()
-        with tensorrt_llm.net_guard(network):
-
+        net = builder.create_network()
+        with tensorrt_llm.net_guard(net):
+            network = tensorrt_llm.default_trtnet()
             input = Tensor(name='input',
                            shape=input_shape,
                            dtype=tensorrt_llm.str_dtype_to_trt(dtype))
@@ -363,21 +328,19 @@ class TestInterpolate(unittest.TestCase):
                 scale_factor=scales_factor,
                 mode=mode,
                 align_corners=align_corners_flag,
-            )
-            output.mark_output('output')
+            ).trt_tensor
+            output.name = 'output'
+            network.mark_output(output)
 
         # trt run
-        session = create_session(builder, network, precision=dtype)
-        inputs = {
-            'input': input_data,
-        }
-        outputs = run_session(session, inputs)
+        build_engine = EngineFromNetwork((builder.trt_builder, net.trt_network))
+        with TrtRunner(build_engine) as runner:
+            outputs = runner.infer(feed_dict={'input': input_data.numpy()})
 
-        # pytorch run
         ref = torch.nn.functional.interpolate(input_data,
                                               scale_factor=scales_factor,
                                               align_corners=align_corners_flag,
                                               mode=mode)
-
-        # compare diff
-        torch.testing.assert_close(ref, outputs['output'])
+        np.testing.assert_allclose(ref.cpu().numpy(),
+                                   outputs['output'],
+                                   atol=1e-5)

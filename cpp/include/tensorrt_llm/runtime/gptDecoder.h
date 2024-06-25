@@ -18,14 +18,17 @@
 
 #include "tensorrt_llm/executor/types.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
+#include "tensorrt_llm/runtime/cudaStream.h"
 #include "tensorrt_llm/runtime/decodingInput.h"
 #include "tensorrt_llm/runtime/decodingOutput.h"
+#include "tensorrt_llm/runtime/modelConfig.h"
 #include "tensorrt_llm/runtime/samplingConfig.h"
-
-#include <NvInferRuntime.h>
+#include "tensorrt_llm/runtime/worldConfig.h"
 #include <curand_kernel.h>
 
 #include <memory>
+
+#include <NvInferRuntime.h>
 
 namespace tensorrt_llm
 {
@@ -40,8 +43,6 @@ class DynamicDecodeLayer;
 namespace runtime
 {
 
-class SpeculativeDecodingModule;
-
 class IGptDecoder
 {
 public:
@@ -50,8 +51,7 @@ public:
     virtual ~IGptDecoder() = default;
 
     virtual void setup(SamplingConfig const& samplingConfig, size_t batchSize,
-        std::optional<TensorPtr> const& batchSlots = std::nullopt,
-        std::optional<DecodingOutput> const& output = std::nullopt)
+        std::optional<TensorPtr> const& batchSlots = std::nullopt)
         = 0;
 
     virtual void forwardAsync(DecodingOutput& output, DecodingInput const& input) = 0;
@@ -76,8 +76,8 @@ public:
 
     static std::unique_ptr<IGptDecoder> create(executor::DecodingMode const& mode, nvinfer1::DataType dtype,
         size_t maxBatchSize, size_t maxBeamWidth, size_t vocabSize, size_t vocabSizePadded, size_t maxSequenceLength,
-        BufferManager::CudaStreamPtr const& stream,
-        std::shared_ptr<SpeculativeDecodingModule const> speculativeDecodingModule = nullptr);
+        BufferManager::CudaStreamPtr const& stream, std::optional<runtime::SizeType32> maxTokensPerStep = std::nullopt,
+        std::optional<runtime::SizeType32> maxAcceptedDraftTokensPerStep = std::nullopt);
 };
 
 template <typename T>
@@ -90,11 +90,11 @@ public:
 
     GptDecoder(executor::DecodingMode const& mode, size_t maxBatchSize, size_t maxBeamWidth, size_t vocabSize,
         size_t vocabSizePadded, size_t maxSequenceLength, CudaStreamPtr const& stream,
-        std::shared_ptr<SpeculativeDecodingModule const> speculativeDecodingModule = nullptr);
+        std::optional<runtime::SizeType32> maxTokensPerStep = std::nullopt,
+        std::optional<runtime::SizeType32> maxAcceptedDraftTokensPerStep = std::nullopt);
 
     void setup(SamplingConfig const& samplingConfig, size_t batchSize,
-        std::optional<TensorPtr> const& batchSlots = std::nullopt,
-        std::optional<DecodingOutput> const& output = std::nullopt) override;
+        std::optional<TensorPtr> const& batchSlots = std::nullopt) override;
 
     void forwardAsync(DecodingOutput& output, DecodingInput const& input) override;
 
@@ -117,26 +117,22 @@ private:
     SamplingConfig mSamplingConfig;
 
     size_t mMaxBatchSize;
-
-    executor::DecodingMode mDecodingMode;
 };
 
 inline std::unique_ptr<IGptDecoder> IGptDecoder::create(executor::DecodingMode const& mode, nvinfer1::DataType dtype,
     size_t maxBatchSize, size_t maxBeamWidth, size_t vocabSize, size_t vocabSizePadded, size_t maxSequenceLength,
-    BufferManager::CudaStreamPtr const& stream,
-    std::shared_ptr<SpeculativeDecodingModule const> speculativeDecodingModule)
+    BufferManager::CudaStreamPtr const& stream, std::optional<runtime::SizeType32> maxTokensPerStep,
+    std::optional<runtime::SizeType32> maxAcceptedDraftTokensPerStep)
 {
     switch (dtype)
     {
     case nvinfer1::DataType::kFLOAT:
         return std::make_unique<GptDecoder<float>>(mode, maxBatchSize, maxBeamWidth, vocabSize, vocabSizePadded,
-            maxSequenceLength, stream, speculativeDecodingModule);
+            maxSequenceLength, stream, maxTokensPerStep, maxAcceptedDraftTokensPerStep);
     case nvinfer1::DataType::kHALF:
         return std::make_unique<GptDecoder<half>>(mode, maxBatchSize, maxBeamWidth, vocabSize, vocabSizePadded,
-            maxSequenceLength, stream, speculativeDecodingModule);
-    default:
-        TLLM_THROW("Unsupported decoder data type: %d. Use either kFLOAT or kHALF.", static_cast<int>(dtype));
-        return nullptr;
+            maxSequenceLength, stream, maxTokensPerStep, maxAcceptedDraftTokensPerStep);
+    default: return nullptr;
     }
 }
 } // namespace runtime

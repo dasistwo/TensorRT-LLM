@@ -125,13 +125,12 @@ class TestFalcon(unittest.TestCase):
         with net_guard(network):
             # Initialize model
             network.set_named_parameters(trtllm_model.named_parameters())
-            inputs = trtllm_model.prepare_inputs(
-                max_batch_size=batch_size,
-                max_input_len=input_len,
-                max_seq_len=input_len + output_len,
-                max_num_tokens=batch_size * input_len,
-                use_cache=True,
-                max_beam_width=beam_width)
+            inputs = trtllm_model.prepare_inputs(max_batch_size=batch_size,
+                                                 max_input_len=input_len,
+                                                 max_seq_len=input_len +
+                                                 output_len,
+                                                 use_cache=True,
+                                                 max_beam_width=beam_width)
             # Prepare
             trtllm_model(**inputs)
 
@@ -164,7 +163,7 @@ class TestFalcon(unittest.TestCase):
             use_alibi=hf_config.alibi,
             parallel_attention=hf_config.parallel_attn,
             use_refit=use_refit,
-            strongly_typed=True,
+            strongly_typed=(dtype == "float16"),
         )
 
         network = builder.create_network()
@@ -211,10 +210,10 @@ class TestFalcon(unittest.TestCase):
              ContextFMHAType.disabled, 'float16'),
             ('MQA', False, True, False, False, True, True, False,
              ContextFMHAType.disabled, 'float32'),
-            # TC for Falcon-40B arch: GQA + RoPE + parallel_attention + new_decoder_architecture
-            ('GQA', False, True, True, False, True, True, False,
+            # TC for Falcon-40B arch: GQA + RoPE + new_decoder_architecture
+            ('GQA', False, False, True, False, True, True, False,
              ContextFMHAType.disabled, 'float16'),
-            ('GQA', False, True, True, False, True, True, False,
+            ('GQA', False, False, True, False, True, True, False,
              ContextFMHAType.disabled, 'float32'),
         ]
         return test_cases

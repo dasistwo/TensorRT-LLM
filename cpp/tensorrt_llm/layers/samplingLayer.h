@@ -17,14 +17,21 @@
 
 #pragma once
 
-#include "tensorrt_llm/executor/types.h"
-#include "tensorrt_llm/layers/baseLayer.h"
-#include "tensorrt_llm/layers/decodingParams.h"
-#include "tensorrt_llm/runtime/common.h"
-
 #include <curand_kernel.h>
 
-namespace tensorrt_llm::layers
+#include "tensorrt_llm/common/tensor.h"
+#include "tensorrt_llm/layers/baseLayer.h"
+#include "tensorrt_llm/layers/decodingParams.h"
+#include "tensorrt_llm/layers/samplingParams.h"
+#include "tensorrt_llm/layers/topKSamplingLayer.h"
+#include "tensorrt_llm/layers/topPSamplingLayer.h"
+#include "tensorrt_llm/runtime/common.h"
+
+namespace tc = tensorrt_llm::common;
+
+namespace tensorrt_llm
+{
+namespace layers
 {
 
 //! \brief Top class for sampling layers.
@@ -41,10 +48,9 @@ public:
     ~SamplingLayer() override = default;
 
     void setup(runtime::SizeType32 batchSize, runtime::SizeType32 beamWidth, runtime::SizeType32 const* batchSlots,
-        std::shared_ptr<BaseSetupParams> const& setupParams) override;
+        std::shared_ptr<BaseSetupParams> setupParams) override;
 
-    void forwardAsync(std::shared_ptr<BaseDecodingOutputs> const& outputs,
-        std::shared_ptr<BaseDecodingInputs> const& inputs) override;
+    void forwardAsync(std::shared_ptr<BaseOutputParams> outputs, std::shared_ptr<BaseInputParams> inputs) override;
 
 private:
     using Base::mWorkspaceSize;
@@ -76,4 +82,5 @@ private:
     void freeBuffer();
 };
 
-} // namespace tensorrt_llm::layers
+} // namespace layers
+} // namespace tensorrt_llm

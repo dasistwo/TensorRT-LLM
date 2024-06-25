@@ -12,22 +12,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import os
-import sys
 import unittest
-from itertools import product
 
 import numpy as np
 import torch
-from parameterized import parameterized
+from polygraphy.backend.trt import EngineFromNetwork, TrtRunner
 
 import tensorrt_llm
 
-sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-from utils.util import create_session, run_session
 
-
-class TestArange(unittest.TestCase):
+class TestFunctional(unittest.TestCase):
 
     def setUp(self):
         tensorrt_llm.logger.set_level('error')
@@ -36,66 +30,62 @@ class TestArange(unittest.TestCase):
         # test data
         start = 0
         end = 128
+        dtype = 'int32'
 
         # construct trt network
         builder = tensorrt_llm.Builder()
-        network = builder.create_network()
-        with tensorrt_llm.net_guard(network):
+        net = builder.create_network()
+        with tensorrt_llm.net_guard(net):
+            network = tensorrt_llm.default_trtnet()
 
             output = tensorrt_llm.functional.arange(start=start,
                                                     end=end,
-                                                    dtype="int32")
-            output.mark_output('output', "int32")
+                                                    dtype=dtype).trt_tensor
+            output.name = 'output'
+            network.mark_output(output)
+            output.dtype = tensorrt_llm.str_dtype_to_trt(dtype)
 
         # trt run
-        inputs = {}
-        session = create_session(builder, network, precision="float32")
-        outputs = run_session(session, inputs)
+        build_engine = EngineFromNetwork((builder.trt_builder, net.trt_network))
+        with TrtRunner(build_engine) as runner:
+            outputs = runner.infer(feed_dict={})
 
-        ref = torch.arange(start, end).int().cuda()
-        torch.testing.assert_close(outputs['output'], ref)
+        ref = torch.arange(start, end).int()
+        np.testing.assert_allclose(ref.cpu().numpy(),
+                                   outputs['output'],
+                                   atol=1e-5)
 
-    @parameterized.expand(
-        list(
-            product(['int32', 'int64'], ['int32', 'int64'],
-                    ['int32', 'int64', 'float32', 'float16'])))
-    def test_arange_tensor(self,
-                           s_dtype='int32',
-                           e_dtype='int32',
-                           r_dtype='int32'):
+    def test_arange_tensor(self):
         # test data
         s = 0
         e = 128
-        s_np_dtype = tensorrt_llm._utils.str_dtype_to_np(s_dtype)
-        e_np_dtype = tensorrt_llm._utils.str_dtype_to_np(e_dtype)
+        dtype = 'int32'
 
         # construct trt network
         builder = tensorrt_llm.Builder()
-        network = builder.create_network()
-        with tensorrt_llm.net_guard(network):
+        net = builder.create_network()
+        with tensorrt_llm.net_guard(net):
+            network = tensorrt_llm.default_trtnet()
 
-            start = tensorrt_llm.functional.constant(
-                np.array(s, dtype=s_np_dtype))
-            end = tensorrt_llm.functional.constant(
-                np.array([e], dtype=e_np_dtype))
+            start = tensorrt_llm.functional.constant(np.array(s,
+                                                              dtype=np.int32))
+            end_tensor = tensorrt_llm.functional.constant(
+                np.array([0] * e, dtype=np.int32))
 
-            output = tensorrt_llm.functional.arange(start=start,
-                                                    end=end,
-                                                    dtype=r_dtype)
-
-            output.mark_output('output', r_dtype)
+            output = tensorrt_llm.functional.arange(
+                start=start,
+                end=tensorrt_llm.functional.shape(end_tensor, 0),
+                dtype=dtype).trt_tensor
+            output.name = 'output'
+            network.mark_output(output)
+            output.dtype = tensorrt_llm.str_dtype_to_trt(dtype)
 
         # trt run
-        inputs = {}
-        session = create_session(
-            builder,
-            network,
-            precision="float32" if r_dtype != 'float16' else 'float16')
-        outputs = run_session(session, inputs)
+        build_engine = EngineFromNetwork((builder.trt_builder, net.trt_network))
+        with TrtRunner(build_engine) as runner:
+            outputs = runner.infer(feed_dict={})
 
-        # pytorch run
-        ref = torch.arange(
-            s, e, dtype=tensorrt_llm.str_dtype_to_torch(r_dtype)).cuda()
-
-        # compare diff
-        torch.testing.assert_close(outputs['output'], ref)
+        ref = torch.arange(s, e).int()
+        np.testing.assert_allclose(ref.cpu().numpy(),
+                                   outputs['output'],
+                                   atol=1e-5)

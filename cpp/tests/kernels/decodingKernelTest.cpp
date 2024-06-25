@@ -21,8 +21,7 @@
 
 #include "tensorrt_llm/common/memoryUtils.h"
 #include "tensorrt_llm/kernels/decodingCommon.h"
-#include "tensorrt_llm/kernels/speculativeDecoding/externalDraftTokensKernels.h"
-#include "tensorrt_llm/kernels/speculativeDecoding/medusaDecodingKernels.h"
+#include "tensorrt_llm/kernels/decodingKernels.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/runtimeKernels.h"
 #include <curand_kernel.h>
@@ -30,7 +29,6 @@
 #include <unordered_set>
 
 namespace tk = tensorrt_llm::kernels;
-namespace tksp = tensorrt_llm::kernels::speculative_decoding;
 namespace tc = tensorrt_llm::common;
 namespace trk = tensorrt_llm::runtime::kernels;
 
@@ -731,9 +729,9 @@ public:
 
     void callAcceptByIds()
     {
-        tksp::invokeAcceptDraftTokensByIds(bufferCast<SizeType32>(*mDraftTokens),
-            bufferCast<SizeType32>(*mTargetTokens), bufferCast<SizeType32>(*mContextLengths),
-            bufferCast<SizeType32>(*mNumsDraftTokens), bufferCast<SizeType32>(*mSequenceLengths),
+        tk::invokeAcceptDraftTokensByIds(bufferCast<SizeType32>(*mDraftTokens), bufferCast<SizeType32>(*mTargetTokens),
+            bufferCast<SizeType32>(*mContextLengths), bufferCast<SizeType32>(*mNumsDraftTokens),
+            bufferCast<SizeType32>(*mSequenceLengths),
             reinterpret_cast<tk::FinishedState*>(bufferCast<tk::FinishedState::UnderlyingType>(*mFinishedSteps)),
             reinterpret_cast<tk::FinishedState*>(bufferCast<tk::FinishedState::UnderlyingType>(*mFinishedFinal)),
             bufferCast<SizeType32>(*mFinishedSum), bufferCast<SizeType32>(*mBatchSlots), mBatchSize, mMaxBatchSize,
@@ -742,7 +740,7 @@ public:
 
     void callAcceptByLogits()
     {
-        tksp::acceptDraftTokensByLogits(bufferCast<T>(*mDraftLogits),
+        tk::acceptDraftTokensByLogits(bufferCast<T>(*mDraftLogits),
             reinterpret_cast<T**>(bufferCast<int64_t>(*mTargetLogitsPtrs)), bufferCast<T>(*mDraftProbs),
             bufferCast<T>(*mTargetProbs), bufferCast<SizeType32>(*mNumsDraftTokens),
             reinterpret_cast<tk::FinishedState*>(bufferCast<tk::FinishedState::UnderlyingType>(*mFinishedSteps)),
@@ -753,7 +751,7 @@ public:
 
     void callAcceptByIdsWithPaths()
     {
-        tksp::acceptDraftTokensByIdsWithPaths(bufferCast<SizeType32>(*mOutputTokens),
+        tk::acceptDraftTokensByIdsWithPaths(bufferCast<SizeType32>(*mOutputTokens),
             bufferCast<SizeType32>(*mDraftTokens), bufferCast<SizeType32>(*mTargetTokens),
             bufferCast<SizeType32>(*mSequenceLengths), bufferCast<SizeType32>(*mAcceptedLengths),
             reinterpret_cast<tk::FinishedState*>(bufferCast<tk::FinishedState::UnderlyingType>(*mFinishedFinal)),
@@ -761,8 +759,8 @@ public:
             reinterpret_cast<T const**>(bufferCast<int64_t>(*mMedusaInputLogitsPtrs)),
             reinterpret_cast<T const**>(bufferCast<int64_t>(*mMedusaLogitsPtrs)),
             bufferCast<SizeType32>(*mTokensPerStep), bufferCast<SizeType32>(*mTokensPerStep),
-            bufferCast<SizeType32>(*mBestPaths), mBatchSize, mMaxBatchSize, mVocabSize, mMaxSeqLen, mMaxNumHeads,
-            mMaxDraftSeqPerStep, mStream->get());
+            bufferCast<SizeType32>(*mBestPaths), mBatchSize, mVocabSize, mMaxBatchSize, mMaxTargetSeqlen, mMaxSeqLen,
+            mMaxNumHeads, mMaxDraftSeqPerStep, mStream->get());
     }
 
     void callTestedKernel()
@@ -1068,8 +1066,7 @@ TYPED_TEST(DecodingKernelsTest, acceptDraftTokensByLogitsKernelLarge)
                       .setAcceptMode(AcceptKernelMode::BY_LOGITS));
 }
 
-// FIXME(nkorobov): test is incorrect and too complicated.
-TYPED_TEST(DecodingKernelsTest, DISABLED_acceptDraftTokensByIdsWithPathsKernelSmall)
+TYPED_TEST(DecodingKernelsTest, acceptDraftTokensByIdsWithPathsKernelSmall)
 {
     this->runTest(DecodingKernelTestParam()
                       .setBatchSize(1)
@@ -1081,8 +1078,7 @@ TYPED_TEST(DecodingKernelsTest, DISABLED_acceptDraftTokensByIdsWithPathsKernelSm
                       .setAcceptMode(AcceptKernelMode::BY_IDS_WITH_PATH));
 }
 
-// FIXME(nkorobov): test is incorrect and too complicated.
-TYPED_TEST(DecodingKernelsTest, DISABLED_acceptDraftTokensByIdsWithPathsKernelLarge)
+TYPED_TEST(DecodingKernelsTest, acceptDraftTokensByIdsWithPathsKernelLarge)
 {
     this->runTest(DecodingKernelTestParam()
                       .setBatchSize(128)
