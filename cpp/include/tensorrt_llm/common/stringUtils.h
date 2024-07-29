@@ -22,6 +22,7 @@
 #include <cuda_fp16.h>
 
 #include <memory>  // std::make_unique
+#include <cstdint>
 #include <sstream> // std::stringstream
 #include <string>
 #include <vector>
