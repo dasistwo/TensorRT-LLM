@@ -23,6 +23,7 @@
 
 #include <memory>  // std::make_unique
 #include <sstream> // std::stringstream
+#include <cstdint>
 #include <string>
 #include <vector>
 
