@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2023-2024, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -28,8 +28,6 @@
 #include "tensorrt_llm/runtime/runtimeKernels.h"
 #include "tensorrt_llm/runtime/tllmLogger.h"
 
-#include "tensorrt_llm/common/cudaAllocator.h"
-#include "tensorrt_llm/common/tensorConversion.h"
 #include "tensorrt_llm/common/tllmException.h"
 
 namespace tensorrt_llm::tests::layers
@@ -66,10 +64,10 @@ private:
     SizeType32 mMaxBatchSize{2 * mBatchSize};
     SizeType32 const mVocabSize{9};
     SizeType32 const mVocabSizePadded{mVocabSize};
-    SizeType32 const mMaxTokensPerStep{12};
-    SizeType32 const mMaxNumHeads{4};
+    SizeType32 const mMaxDecodingTokens{12};
+    SizeType32 const mMaxDraftPathLen{4};
 
-    SizeType32 const mMaxSeqLen{mMaxTokensPerStep};
+    SizeType32 const mMaxSeqLen{mMaxDecodingTokens};
     TokenIdType mEndId{mVocabSize};
 
     bool mUseLogitsVec{false};
@@ -92,11 +90,10 @@ private:
 
     TensorPtr mTokensPerStepDevice;
 
-    std::vector<tensorrt_llm::common::Tensor> mLogitsVec;
+    std::vector<TensorPtr> mLogitsVec;
 
     std::shared_ptr<tensorrt_llm::runtime::CudaStream> mStream;
     std::shared_ptr<tensorrt_llm::runtime::BufferManager> mBufferManager;
-    std::shared_ptr<tensorrt_llm::common::CudaAllocator> mAllocator;
     std::shared_ptr<tensorrt_llm::layers::MedusaDecodingLayer<T>> mMedusaDecodingLayer;
 
 private:
@@ -104,9 +101,9 @@ private:
 
     void setup(SamplingParams& params);
 
-    std::shared_ptr<tensorrt_llm::layers::MedusaInputParams> createInputTensors();
+    std::shared_ptr<tensorrt_llm::layers::MedusaDecodingInputs> createInputTensors();
 
-    std::shared_ptr<tensorrt_llm::layers::DynamicDecodeOutputParams> createOutputTensors();
+    std::shared_ptr<tensorrt_llm::layers::SpeculativeDecodingOutputs> createOutputTensors();
 
     void checkResult(std::vector<std::vector<std::set<TokenIdType>>> const& expectedOutTokens,
         std::vector<std::vector<TokenIdType>> const& expectedDraftTokens, std::vector<bool> const& finished,

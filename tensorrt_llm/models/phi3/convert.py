@@ -1,13 +1,19 @@
 import torch
 
 from ..._utils import str_dtype_to_torch
+from .split_weights import shuffle_qkv_weights, split_weights_tp
 
 
-def convert_hf_weights(hf_model, dtype, **kwargs):
-    torch_dtype = str_dtype_to_torch(dtype)
+def load_weights_from_hf_model(hf_model, config):
+    torch_dtype = str_dtype_to_torch(config.dtype)
     hf_state_dict = hf_model.state_dict()
     weights = {}
 
+    config.quant_mode.is_weight_only()
+    if config.quant_mode.is_int8_weight_only():
+        torch.int8
+    elif config.quant_mode.is_int4_weight_only():
+        torch.quint4x2
     # replace key name
     for key, value in hf_state_dict.items():
         # Decoder Layers
@@ -16,13 +22,15 @@ def convert_hf_weights(hf_model, dtype, **kwargs):
             key = key.replace("model.layers.", "transformer.layers.")
             #Attention
             key = key.replace("self_attn.", "attention.")
+            key = key.replace("query_key_value.", "qkv.")  # small
             key = key.replace("Wqkv.weight", "qkv.weight")
             key = key.replace("qkv_proj.", "qkv.")  #128k
             #MLP
             key = key.replace("mlp.fc1.", "mlp.fc.")
             key = key.replace("mlp.fc2.", "mlp.proj.")
             key = key.replace("mlp.gate_up_proj.", "mlp.fc.")
-            key = key.replace("mlp.up_proj.", "mlp.gate.")  #128k
+            key = key.replace("mlp.up_proj.", "mlp.fc." if config.architecture
+                              == 'Phi3SmallForCausalLM' else "mlp.gate.")  #128k
             key = key.replace("mlp.down_proj.", "mlp.proj.")  #128k
             key = key.replace("mlp.gate_proj.", "mlp.fc.")  #128k
             key = key.replace("o_proj.", "dense.")  #128k
@@ -54,35 +62,18 @@ def convert_hf_weights(hf_model, dtype, **kwargs):
             key = key.replace("q_proj.weight", "qkv.weight")
         elif "k_proj" in key or "v_proj" in key:
             continue
+
         weights[key] = value.to(torch_dtype).cpu()
 
+    if config.architecture == 'Phi3SmallForCausalLM':
+        weights['lm_head.weight'] = weights[
+            'transformer.vocab_embedding.weight'].clone()
+
+        # Transform QKV weights from custom Phi3Small format to TRT-LLM format
+        for key, value in weights.items():
+            if "qkv." in key:
+                weights[key] = shuffle_qkv_weights(weights[key], config)
+
+        weights = split_weights_tp(config, weights, torch_dtype)
+
     return weights
-
-
-def convert_hf_config(hf_config, dtype, **kwargs):
-    config = {
-        'architecture': "Phi3ForCausalLM",
-        'dtype': dtype,
-        'num_hidden_layers': hf_config.num_hidden_layers,
-        'num_attention_heads': hf_config.num_key_value_heads,
-        'rope_theta': hf_config.rope_theta,
-        'hidden_size': hf_config.hidden_size,
-        'intermediate_size': hf_config.intermediate_size,
-        'vocab_size': hf_config.vocab_size,
-        'max_position_embeddings': hf_config.max_position_embeddings,
-        'hidden_act': hf_config.hidden_act,
-        'share_embedding_table': False,
-        'norm_epsilon': hf_config.rms_norm_eps,
-    }
-    if hf_config.max_position_embeddings >= 128000:
-        config.update({
-            'original_max_position_embeddings':
-            hf_config.original_max_position_embeddings,
-            'longrope_scaling_short_factors':
-            hf_config.rope_scaling["short_factor"],
-            'longrope_scaling_long_factors':
-            hf_config.rope_scaling["long_factor"]
-        })
-    if config["hidden_act"] == "silu":
-        config["hidden_act"] = "swiglu"
-    return config

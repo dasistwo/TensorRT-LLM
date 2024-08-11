@@ -172,8 +172,6 @@ template <typename Config, typename RunnerPtr, typename GemmIdType, typename Gem
 class GemmPluginProfiler
 {
 public:
-    static constexpr int MAX_PROFILE_M = 8192;
-
     // Map for single GEMM for different Ms (GEMM dimension) to the best config for particular M
     using MProfileMap = std::unordered_map<int, std::optional<Config>>;
     using MProfileMapPtr = std::shared_ptr<MProfileMap>;
@@ -209,7 +207,7 @@ public:
             {
                 std::ostringstream msg;
                 msg << "Cannot find ID (" << id << ") in the profile map. Abort.";
-                TLLM_LOG_ERROR(msg.str());
+                TLLM_THROW(msg.str());
             }
             return iter->second;
         }
@@ -244,10 +242,12 @@ public:
 
     std::optional<Config> getBestConfig(int m, GemmIdType const& gemmId) const;
 
+    virtual int getMaxProfileM() const;
+
 protected:
     virtual void runTactic(int m, int n, int k, Config const& tactic, char* workspace, cudaStream_t const& stream) = 0;
 
-    virtual void computeTmpSize(int maxM, int n, int k) = 0;
+    virtual void computeTmpSize(size_t maxM, size_t n, size_t k) = 0;
 
     virtual bool checkTactic(int m, int n, int k, Config const& tactic) const
     {
@@ -256,7 +256,7 @@ protected:
 
     virtual std::vector<Config> getTactics(int m, int n, int k) const = 0;
 
-    virtual void initTmpData(int m, int n, int k, char* workspace, size_t size, cudaStream_t stream){};
+    virtual void initTmpData(int m, int n, int k, char* workspace, size_t size, cudaStream_t stream);
 
 private:
     void allocateTmpData();

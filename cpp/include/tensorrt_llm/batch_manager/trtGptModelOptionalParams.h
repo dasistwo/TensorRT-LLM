@@ -23,6 +23,7 @@
 #include "tensorrt_llm/runtime/common.h"
 
 #include <optional>
+#include <utility>
 #include <vector>
 
 namespace tensorrt_llm::batch_manager
@@ -39,15 +40,25 @@ public:
         bool enableTrtOverlap = false, std::optional<std::vector<SizeType32>> const& deviceIds = std::nullopt,
         bool normalizeLogProbs = true, bool enableChunkedContext = false,
         PeftCacheManagerConfig const& peftCacheManagerConfig = PeftCacheManagerConfig{},
-        executor::DecodingConfig const& decodingConfig = executor::DecodingConfig{}, float gpuWeightsPercent = 1)
+        executor::DecodingConfig decodingConfig = executor::DecodingConfig{}, float gpuWeightsPercent = 1,
+        std::optional<SizeType32> maxBeamWidth = std::nullopt, std::optional<SizeType32> maxBatchSize = std::nullopt,
+        std::optional<SizeType32> maxNumTokens = std::nullopt,
+        executor::SchedulerConfig const& schedulerConfig = executor::SchedulerConfig{},
+        executor::ExtendedRuntimePerfKnobConfig const& extendedRuntimePerfKnobConfig
+        = executor::ExtendedRuntimePerfKnobConfig{})
         : kvCacheConfig{kvCacheConfig}
         , enableTrtOverlap{enableTrtOverlap}
         , deviceIds(deviceIds)
         , normalizeLogProbs{normalizeLogProbs}
         , enableChunkedContext{enableChunkedContext}
         , peftCacheManagerConfig(peftCacheManagerConfig)
-        , decodingConfig(decodingConfig)
+        , decodingConfig(std::move(decodingConfig))
         , gpuWeightsPercent(gpuWeightsPercent)
+        , maxBeamWidth(maxBeamWidth)
+        , maxBatchSize(maxBatchSize)
+        , maxNumTokens(maxNumTokens)
+        , schedulerConfig{schedulerConfig}
+        , extendedRuntimePerfKnobConfig(extendedRuntimePerfKnobConfig)
     {
     }
 
@@ -57,7 +68,9 @@ public:
             executorConfig.getNormalizeLogProbs(), executorConfig.getEnableChunkedContext(),
             PeftCacheManagerConfig(executorConfig.getPeftCacheConfig().value_or(executor::PeftCacheConfig())),
             executorConfig.getDecodingConfig().value_or(executor::DecodingConfig{}),
-            executorConfig.getGpuWeightsPercent())
+            executorConfig.getGpuWeightsPercent(), executorConfig.getMaxBeamWidth(), executorConfig.getMaxBatchSize(),
+            executorConfig.getMaxNumTokens(), executorConfig.getSchedulerConfig(),
+            executorConfig.getExtendedRuntimePerfKnobConfig())
     {
     }
 
@@ -65,7 +78,9 @@ public:
     {
         return kvCacheConfig == other.kvCacheConfig && enableTrtOverlap == other.enableTrtOverlap
             && deviceIds == other.deviceIds && normalizeLogProbs == other.normalizeLogProbs
-            && enableChunkedContext == other.enableChunkedContext && decodingConfig == other.decodingConfig;
+            && enableChunkedContext == other.enableChunkedContext && decodingConfig == other.decodingConfig
+            && gpuWeightsPercent == other.gpuWeightsPercent
+            && extendedRuntimePerfKnobConfig == other.extendedRuntimePerfKnobConfig;
     }
 
     friend std::ostream& operator<<(std::ostream& os, TrtGptModelOptionalParams const& self);
@@ -80,6 +95,11 @@ public:
     executor::DecodingConfig decodingConfig;
     // Percentage of weights on the gpu at runtime
     float gpuWeightsPercent;
+    std::optional<SizeType32> maxBeamWidth;
+    std::optional<SizeType32> maxBatchSize;
+    std::optional<SizeType32> maxNumTokens;
+    executor::SchedulerConfig schedulerConfig;
+    executor::ExtendedRuntimePerfKnobConfig extendedRuntimePerfKnobConfig;
 };
 
 } // namespace tensorrt_llm::batch_manager

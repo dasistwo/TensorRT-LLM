@@ -84,13 +84,14 @@ TransformerBuffers::TransformerBuffers(
         pastKeyValueLengths = manager.emptyTensor(MemoryType::kCPU, nvinfer1::DataType::kINT32);
         maxAttentionWindows = BufferManager::cpu(ITensor::makeShape({localNbLayers}), nvinfer1::DataType::kINT32);
         sinkTokenLengths = manager.emptyTensor(MemoryType::kCPU, nvinfer1::DataType::kINT32);
+        SizeType32 perfKnobSize = 16;
+        runtimePerfKnobsHost = BufferManager::cpu(ITensor::makeShape({perfKnobSize}), nvinfer1::DataType::kINT64);
+        auto runtimePerfKnobsHostPtr = bufferCast<int64_t>(*runtimePerfKnobsHost);
+        std::fill_n(runtimePerfKnobsHostPtr, perfKnobSize, -1);
     }
     else
     {
-        char* disableReuseChar = std::getenv("TRTLLM_DISABLE_OOTB_KVCACHE_REUSE");
-        bool reuse = (disableReuseChar == nullptr || std::string(disableReuseChar) != "ON");
-
-        int32_t extraKeyValBufferNum = reuse ? 1 : localNbLayers;
+        constexpr int32_t extraKeyValBufferNum = 1;
         presentKeysValsAlt = utils::createBufferVector(runtime, extraKeyValBufferNum, MemoryType::kGPU, kvDtype);
     }
 
@@ -201,6 +202,7 @@ TransformerBuffers TransformerBuffers::sliceTo(
         buffers.pastKeyValueLengths = ITensor::slice(pastKeyValueLengths, offset, batchSize);
         buffers.maxAttentionWindows = maxAttentionWindows;
         buffers.sinkTokenLengths = sinkTokenLengths;
+        buffers.runtimePerfKnobsHost = runtimePerfKnobsHost;
     }
     else
     {
@@ -311,7 +313,7 @@ void TransformerBuffers::prepareContextStep(RuntimeBuffers* runtimeBuffers, Tens
             }
             positionIds = manager.copyFrom(positionIdsVec, inputShape, MemoryType::kGPU);
         }
-        else if (modelVariant == ModelConfig::ModelVariant::kGlm)
+        else if (modelVariant == ModelConfig::ModelVariant::kChatGlm)
         {
             auto const positionIdsVec = getPositionIdsContextPhaseGlm(batchSize, maxInputLength, contextLengthsHostPtr,
                 modelConfig.useGptAttentionPlugin(), modelConfig.usePackedInput());
@@ -581,7 +583,7 @@ void TransformerBuffers::prepareNextStep(RuntimeBuffers* runtimeBuffers, SizeTyp
             manager.copy(*contextLengthsDevice, *positionIds);
             kernels::invokeAdd(*positionIds, step, stream);
         }
-        else if (modelVariant == ModelConfig::ModelVariant::kGlm)
+        else if (modelVariant == ModelConfig::ModelVariant::kChatGlm)
         {
             auto const positionIdsVec = getPositionIdsGenerationPhaseGlm(batchSize, beamWidth, step,
                 contextLengthsHostPtr, modelConfig.useGptAttentionPlugin(), modelConfig.usePackedInput());
@@ -707,6 +709,7 @@ void TransformerBuffers::getRuntimeBuffers(RuntimeBuffers const* runtimeBuffers,
         inputBuffers.insert_or_assign("sequence_length", runtimeBuffers->sequenceLengths);
         inputBuffers.insert_or_assign("host_sink_token_length", sinkTokenLengths);
         inputBuffers.insert_or_assign("host_max_attention_window_sizes", maxAttentionWindows);
+        inputBuffers.insert_or_assign("host_runtime_perf_knobs", runtimePerfKnobsHost);
 
         if (modelConfig.usePackedInput())
         {
@@ -737,42 +740,32 @@ void TransformerBuffers::getRuntimeBuffers(RuntimeBuffers const* runtimeBuffers,
             kvCacheShape = presentKeysValsAlt.at(0)->getShape();
             kvCacheShape.d[3] = 0;
         }
-        char* disableReuseChar = std::getenv("TRTLLM_DISABLE_OOTB_KVCACHE_REUSE");
-        bool reuse = (disableReuseChar == nullptr || std::string(disableReuseChar) != "ON");
 
         // TODO: fix for recurrentgemma
         for (int32_t idx = 0; idx < localNbLayers; ++idx)
         {
             TensorPtr input;
             TensorPtr output;
-            if (reuse)
+            // We will make current layer's output KV-cache overwrite previous layers input KV-cache
+            // buffer id: ...  5,  6,  7,  8,  9, ...
+            // layer n:        out in
+            // layer n+1:          out in
+            // layer n+2               out in
+            // And when finish a step, we will make every layer's in/out buffer index subtract 1 in
+            // a circular buffer way to make sure current outputs become next step's inputs.
+            int32_t input_ind = idx - (step % (localNbLayers + 1)); // Subtract 1 for every step.
+            if (input_ind < 0)
             {
-                // We will make current layer's output KV-cache overwrite previous layers input KV-cache
-                // buffer id: ...  5,  6,  7,  8,  9, ...
-                // layer n:        out in
-                // layer n+1:          out in
-                // layer n+2               out in
-                // And when finish a step, we will make every layer's in/out buffer index subtract 1 in
-                // a circular buffer way to make sure current outputs become next step's inputs.
-                int32_t input_ind = idx - (step % (localNbLayers + 1)); // Subtract 1 for every step.
-                if (input_ind < 0)
-                {
-                    // When underflow, go to the back to achieve a circular buffers.
-                    input_ind = localNbLayers + 1 + input_ind;
-                }
-                // Output buffer is just before input buffer. When input is buffer 0,
-                // output should use the back buffer to achieve circular buffers.
-                int32_t output_ind = input_ind > 0 ? input_ind - 1 : localNbLayers;
+                // When underflow, go to the back to achieve a circular buffers.
+                input_ind = localNbLayers + 1 + input_ind;
+            }
+            // Output buffer is just before input buffer. When input is buffer 0,
+            // output should use the back buffer to achieve circular buffers.
+            int32_t output_ind = input_ind > 0 ? input_ind - 1 : localNbLayers;
 
-                // We only allocate localNbLayers of normal buffers. If index is overflow, use the extra buffer.
-                input = input_ind < localNbLayers ? presentKeysVals[input_ind] : presentKeysValsAlt[0];
-                output = output_ind < localNbLayers ? presentKeysVals[output_ind] : presentKeysValsAlt[0];
-            }
-            else
-            {
-                input = step % 2 ? presentKeysVals[idx] : presentKeysValsAlt[idx];
-                output = step % 2 ? presentKeysValsAlt[idx] : presentKeysVals[idx];
-            }
+            // We only allocate localNbLayers of normal buffers. If index is overflow, use the extra buffer.
+            input = input_ind < localNbLayers ? presentKeysVals[input_ind] : presentKeysValsAlt[0];
+            output = output_ind < localNbLayers ? presentKeysVals[output_ind] : presentKeysValsAlt[0];
 
             if (step == 0)
             {

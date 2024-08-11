@@ -29,7 +29,16 @@
 namespace mpi = tensorrt_llm::mpi;
 namespace tr = tensorrt_llm::runtime;
 
-TEST(MPIUtils, RankAndSize)
+TEST(MPIUtils, SessionRankAndSize)
+{
+    auto& session = mpi::MpiComm::session();
+    auto const rank = session.getRank();
+    EXPECT_LE(0, rank);
+    auto const size = session.getSize();
+    EXPECT_LE(rank, size);
+}
+
+TEST(MPIUtils, WorldRankAndSize)
 {
     auto& comm = mpi::MpiComm::world();
     auto const rank = comm.getRank();
@@ -217,15 +226,79 @@ TEST(MPIUtils, SessionCommunicator)
     auto sessionRank = rank % sessionSize;
     auto& session = mpi::MpiComm::session();
     EXPECT_EQ(session, world);
-    session = world.split(sessionColor, sessionRank);
-    EXPECT_EQ(session, mpi::MpiComm::session());
-    EXPECT_NE(session, world);
-    EXPECT_EQ(session.getRank(), sessionRank);
-    EXPECT_LE(sessionSize - 1, session.getSize());
-    EXPECT_LE(session.getSize(), sessionSize);
+    auto session1 = world.split(sessionColor, sessionRank);
+    EXPECT_NE(session1, world);
+    EXPECT_EQ(session1.getRank(), sessionRank);
+    EXPECT_LE(sessionSize - 1, session1.getSize());
+    EXPECT_LE(session1.getSize(), sessionSize);
 
-    session = session.split(sessionRank, 0);
-    EXPECT_EQ(session, mpi::MpiComm::session());
-    EXPECT_EQ(session.getRank(), 0);
-    EXPECT_EQ(session.getSize(), 1);
+    auto session2 = session1.split(sessionRank, 0);
+    EXPECT_EQ(session2.getRank(), 0);
+    EXPECT_EQ(session2.getSize(), 1);
+}
+
+TEST(MPIUtils, VectorBcastEmpty)
+{
+    auto& session = mpi::MpiComm::session();
+    auto myRank = session.getRank();
+    size_t vecSize = 0;
+    std::vector<char> vec;
+    session.bcast(vec, 0);
+
+    ASSERT_EQ(vec.size(), vecSize);
+}
+
+// Not fundamental
+struct NotFundamental
+{
+    int a = 1;
+    int b = 2;
+};
+
+bool operator==(NotFundamental const& lhs, NotFundamental const& rhs)
+{
+    return (lhs.a == rhs.a) && (lhs.b == rhs.b);
+};
+
+TEST(MPIUtils, VectorBcastOverflow)
+{
+    auto& comm = mpi::MpiComm::world();
+    auto myRank = comm.getRank();
+    auto intLimit = static_cast<size_t>(std::numeric_limits<int32_t>::max());
+    auto vecSizes = std::vector<size_t>{100000, static_cast<size_t>(1.5 * intLimit)};
+
+    for (auto vecSize : vecSizes)
+    {
+        std::cout << myRank << " testing with size : " << vecSize << std::endl;
+        // Fundamental type
+        {
+            std::vector<char> vec;
+            char expected = 42;
+            if (myRank == 0)
+            {
+                vec.assign(vecSize, expected);
+            }
+            comm.bcast(vec, 0);
+            EXPECT_EQ(vec.size(), vecSize);
+            for (auto const& val : vec)
+            {
+                EXPECT_EQ(val, expected);
+            }
+        }
+        // Not fundamental type
+        {
+            std::vector<NotFundamental> vec;
+            auto expected = NotFundamental{45, 66};
+            if (myRank == 0)
+            {
+                vec.assign(vecSize, expected);
+            }
+            comm.bcast(vec, 0);
+            EXPECT_EQ(vec.size(), vecSize);
+            for (auto const& val : vec)
+            {
+                EXPECT_EQ(val, expected);
+            }
+        }
+    }
 }

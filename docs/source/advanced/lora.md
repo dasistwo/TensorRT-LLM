@@ -23,7 +23,7 @@ trtllm-build --checkpoint_dir /tmp/llama_7b/trt_ckpt/fp16/1-gpu/ \
     --lora_plugin float16 \
     --max_batch_size 128 \
     --max_input_len 512 \
-    --max_output_len 50 \
+    --max_seq_len 562 \
     --lora_dir Japanese-Alpaca-LoRA-7b-v0 \
     --max_lora_rank 8 \
     --lora_target_modules "attn_q" "attn_k" "attn_v"
@@ -112,6 +112,7 @@ The following tensors are for a LoRA which has a `q` and `k` adapter.
 | moe_4h_to_h | 14 | for mixtral adapter for expert mlp layer: down projection |
 | moe_gate | 15 | for mixtral adapter for expert mlp layer: gate |
 | moe_router | 16 | for mixtral adapter for expert router layer |
+| mlp_router | 17 | for qwen2-moe adapter for shared expert gate layer |
 
 #### LoraCache configuration
 

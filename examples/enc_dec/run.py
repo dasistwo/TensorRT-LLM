@@ -29,8 +29,10 @@ from transformers import (AutoConfig, AutoModelForSeq2SeqLM, AutoTokenizer,
 
 import tensorrt_llm
 from tensorrt_llm import logger
+from tensorrt_llm._ipc_utils import set_peer_access
 from tensorrt_llm._utils import torch_to_numpy, trt_dtype_to_torch
 from tensorrt_llm.lora_manager import LoraManager
+from tensorrt_llm.plugin.plugin import CustomAllReduceHelper
 from tensorrt_llm.runtime import ModelConfig, SamplingConfig
 
 
@@ -88,7 +90,6 @@ def read_config(config_path: Path):
     skip_cross_qkv = pretrained_config.get('skip_cross_qkv', False)
     has_position_embedding = pretrained_config["has_position_embedding"]
     has_token_type_embedding = hasattr(pretrained_config, "type_vocab_size")
-    use_custom_all_reduce = plugin_config.get('use_custom_all_reduce', False)
     dtype = pretrained_config["dtype"]
 
     paged_kv_cache = plugin_config['paged_kv_cache']
@@ -116,7 +117,6 @@ def read_config(config_path: Path):
         cross_attention=cross_attention,
         has_position_embedding=has_position_embedding,
         has_token_type_embedding=has_token_type_embedding,
-        use_custom_all_reduce=use_custom_all_reduce,
         dtype=dtype,
         gather_context_logits=gather_context_logits,
         gather_generation_logits=gather_generation_logits,
@@ -153,26 +153,24 @@ def parse_arguments():
                         action='store_true')
     parser.add_argument('--lora_dir', type=str, default=None, nargs="+")
     parser.add_argument('--lora_task_uids', type=str, default=None, nargs="+")
-    parser.add_argument(
-        "--output_encoder_npy",
-        help=
-        "Store tensors like encoder outputs used for testing enc-dec C++ runtime.",
-        action="store_true")
+    parser.add_argument("--output_npy",
+                        type=str,
+                        default=None,
+                        help="Store input/output tensors C++ runtime testing")
     return parser.parse_args()
 
 
 class TRTLLMEncDecModel:
 
-    def __init__(
-        self,
-        engine_name,
-        engine_dir,
-        lora_dir=None,
-        lora_task_uids=None,
-        debug_mode=False,
-        skip_encoder=False,
-        stream: torch.cuda.Stream = None,
-    ):
+    def __init__(self,
+                 engine_name,
+                 engine_dir,
+                 lora_dir=None,
+                 lora_task_uids=None,
+                 debug_mode=False,
+                 skip_encoder=False,
+                 stream: torch.cuda.Stream = None,
+                 enable_context_fmha_fp32_acc: bool = None):
         # in multi-node setup, it's important to set_device at the very beginning so .to('cuda') refers to current device
         # accordingly, all input & output tensors should be moved to current device
         # otherwise, it's default to 'cuda:0'
@@ -182,6 +180,7 @@ class TRTLLMEncDecModel:
         self.device = torch.cuda.current_device()
         self.skip_encoder = skip_encoder
         self.lora_task_uids = lora_task_uids
+        self.enable_context_fmha_fp32_acc = enable_context_fmha_fp32_acc
 
         # when enc-dec runs by itself, stream can be None and we create new stream here
         # when enc-dec has to run as a component in a bigger workflow (e.g., multimodal), earlier components in the workflow may have results in its stream, which we should pass that stream in to avoid unnecessary stream sync
@@ -222,11 +221,13 @@ class TRTLLMEncDecModel:
             self.encoder_model_config, self.encoder_runtime_mapping, encoder_engine_buffer = engine_setup(
                 component='encoder')
 
-            # for Pipeline Parallelism in encoder
-            self.nccl_comm = torch.classes.trtllm.NcclCommunicatorOp(
-                self.encoder_runtime_mapping.tp_size,
-                self.encoder_runtime_mapping.pp_size,
-                self.encoder_runtime_mapping.rank)
+            self.nccl_comm = None
+            if self.encoder_runtime_mapping.has_pp():
+                # for Pipeline Parallelism in encoder
+                self.nccl_comm = torch.classes.trtllm.NcclCommunicatorOp(
+                    self.encoder_runtime_mapping.tp_size,
+                    self.encoder_runtime_mapping.pp_size,
+                    self.encoder_runtime_mapping.rank)
 
             # session setup
             self.encoder_session = tensorrt_llm.runtime.Session.from_serialized_engine(
@@ -277,14 +278,16 @@ class TRTLLMEncDecModel:
                     lora_task_uids=None,
                     debug_mode=False,
                     skip_encoder=False,
-                    stream=None):
+                    stream=None,
+                    enable_context_fmha_fp32_acc=None):
         return cls(engine_name,
                    engine_dir,
                    lora_dir,
                    lora_task_uids,
                    debug_mode=debug_mode,
                    skip_encoder=skip_encoder,
-                   stream=stream)
+                   stream=stream,
+                   enable_context_fmha_fp32_acc=enable_context_fmha_fp32_acc)
 
     def process_input(self,
                       input_ids,
@@ -386,19 +389,27 @@ class TRTLLMEncDecModel:
             (max_input_length, ),
             dtype=hidden_states_dtype('max_input_length'),
             device=self.device).contiguous()
-        batch_size = input_lengths.size(0)
-        inputs['host_request_types'] = torch.IntTensor([0] *
-                                                       batch_size).to('cpu')
-        if self.encoder_model_config.remove_input_padding:
-            inputs['host_context_lengths'] = input_lengths.to('cpu')
 
-        if self.encoder_model_config.lora_plugin and self.encoder_lora_manager is not None:
+        if self.encoder_runtime_mapping.tp_size > 1:
+            is_p2p_supported = set_peer_access(self.encoder_runtime_mapping)
+            ipc_buffers, all_reduce_workspace = CustomAllReduceHelper.allocate_workspace(
+                self.encoder_runtime_mapping,
+                CustomAllReduceHelper.max_workspace_size_auto(
+                    self.encoder_runtime_mapping.tp_size), is_p2p_supported)
+            inputs['all_reduce_workspace'] = all_reduce_workspace
+
+        if self.encoder_model_config.lora_plugin:
             inputs.update(
                 self.encoder_lora_manager.input_buffers(
                     self.lora_task_uids,
                     self.encoder_runtime_mapping,
                     self.encoder_model_config.num_layers,
                 ))
+            batch_size = input_lengths.size(0)
+            inputs['host_request_types'] = torch.IntTensor([0] *
+                                                           batch_size).to('cpu')
+            if self.encoder_model_config.remove_input_padding:
+                inputs['host_context_lengths'] = input_lengths.to('cpu')
 
         # Note: runtime.Session's run() method will set input/output tensor address, here we only need to provide tensor shape
         self.encoder_session.set_shapes(inputs)
@@ -569,7 +580,7 @@ class TRTLLMEncDecModel:
             encoder_max_input_length=encoder_max_input_length,
             lora_manager=self.decoder_lora_manager,
             lora_uids=self.lora_task_uids,
-        )
+            enable_context_fmha_fp32_acc=self.enable_context_fmha_fp32_acc)
 
         output = self.decoder_session.decode(
             decoder_input_ids,
@@ -579,8 +590,10 @@ class TRTLLMEncDecModel:
             encoder_input_lengths=encoder_input_lengths,
             return_dict=return_dict,
             cross_attention_mask=cross_attention_mask)
-        if return_encoder_output:
-            return output, encoder_output
+
+        if return_dict and return_encoder_output:
+            output['encoder_output'] = encoder_output
+
         return output
 
 
@@ -643,8 +656,8 @@ def test_fairseq_models(args):
         eos_token_id=eos_token_id,
         debug_mode=args.debug_mode,
     )
-    tok = time.time()
     torch.cuda.synchronize()
+    tok = time.time()
 
     if return_dict:
         tllm_output_ids = tllm_output['output_ids']
@@ -722,21 +735,7 @@ if __name__ == "__main__":
         'cuda')  # [batch_size, padded_length]
     # by default int64, must cast to int32! otherwise C++ kernel will interpret as [a, 0, b, 0, c, 0, ...]
 
-    CPP_RESULTS_SAVED_DIR = 'cpp/tests/resources/data/enc_dec'
     if tensorrt_llm.mpi_rank() == 0:
-        if args.output_encoder_npy:
-            if not os.path.isdir(CPP_RESULTS_SAVED_DIR):
-                os.mkdir(os.path.join(CPP_RESULTS_SAVED_DIR))
-            np_input_ids = tokenized_inputs.input_ids.type(torch.IntTensor)
-            np_input_ids = np_input_ids.numpy()
-            np.save(os.path.join(CPP_RESULTS_SAVED_DIR, 'enc_input_ids.npy'),
-                    np_input_ids)
-            input_lengths = tokenized_inputs.attention_mask.sum(dim=1).type(
-                torch.IntTensor).numpy()
-            np.save(
-                os.path.join(CPP_RESULTS_SAVED_DIR, 'enc_input_lengths.npy'),
-                input_lengths)
-
         print("--------------------------------------")
         print(
             f"BOS={tokenizer.bos_token_id}, PAD={tokenizer.pad_token_id}, EOS={tokenizer.eos_token_id}"
@@ -811,7 +810,7 @@ if __name__ == "__main__":
             print(f"HF E2E time {(tok-tik)*1000}ms")
             print("--------------------------------------")
 
-    return_dict = False  # when set return_dict=True, get outputs by key
+    return_dict = True  # when set return_dict=True, get outputs by key
     tik = time.time()
     tllm_output = tllm_model.generate(
         encoder_input_ids=input_ids,
@@ -825,21 +824,16 @@ if __name__ == "__main__":
         return_dict=return_dict,
         attention_mask=tokenized_inputs.attention_mask,
         time_encoder=True,
-        return_encoder_output=args.output_encoder_npy
-        and tensorrt_llm.mpi_rank() == 0)
+        return_encoder_output=args.output_npy and tensorrt_llm.mpi_rank() == 0)
+    torch.cuda.synchronize()
     tok = time.time()
-    if args.output_encoder_npy and tensorrt_llm.mpi_rank() == 0:
-        tllm_output, encoder_output = tllm_output
-        encoder_output = encoder_output.cpu().numpy()
-        np.save(os.path.join(CPP_RESULTS_SAVED_DIR, 'encoder_output.npy'),
-                encoder_output)
-
-    if return_dict:
-        tllm_output_ids = tllm_output['output_ids']
-    else:
-        tllm_output_ids = tllm_output
 
     if tensorrt_llm.mpi_rank() == 0:
+        if return_dict:
+            tllm_output_ids = tllm_output['output_ids']
+        else:
+            tllm_output_ids = tllm_output
+
         output_ids = tllm_output_ids[:, 0, :]
         output_text = tokenizer.batch_decode(output_ids,
                                              skip_special_tokens=True)
@@ -847,6 +841,7 @@ if __name__ == "__main__":
                                  tokenizer.pad_token_id).sum(dim=1)
         output_gen_lengths = (output_ids != tokenizer.eos_token_id).sum(
             dim=1) - decoder_input_lengths
+
         print("--------------------------------------")
         print("TRT-LLM output_ids: ", output_ids)
         print("TRT-LLM output text: ", output_text)
@@ -854,6 +849,34 @@ if __name__ == "__main__":
         print(f"TRT-LLM E2E time {(tok-tik)*1000}ms")
         print("Precision:", inference_dtype)
         print("--------------------------------------")
+
+        # save input/output tensors for C++ runtime testing
+        if args.output_npy:
+            os.makedirs(args.output_npy, exist_ok=True)
+
+            input_lengths = tokenized_inputs.attention_mask.sum(dim=1).type(
+                torch.IntTensor)
+            input_ids = tokenized_inputs.input_ids.type(torch.IntTensor)
+            input_ids_flatten = torch.cat([
+                input_ids[i][:input_lengths[i]]
+                for i in range(len(input_lengths))
+            ])
+            encoder_output = tllm_output['encoder_output'].type(torch.float16)
+
+            def save_npy(tensor, name):
+                np.save(os.path.join(args.output_npy, f'{name}.npy'),
+                        tensor.cpu().numpy())
+
+            print(
+                f"Saving input/output tensors to {args.output_npy} for C++ runtime testing"
+            )
+            save_npy(input_ids_flatten, 'input_ids')  # [num_tokens]
+            save_npy(input_lengths, 'input_lengths')  # [batch_size]
+            save_npy(encoder_output,
+                     'encoder_output')  # [num_tokens, hidden_size]
+            save_npy(
+                output_ids, 'output_ids'
+            )  # [batch_size, max_output_tokens], max_output_tokens = decoder_input_tokens + max_new_tokens
 
         # simple accuracy check
         if args.compare_hf_fp32:

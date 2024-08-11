@@ -1,6 +1,5 @@
 /*
- * Copyright (c) 2019-2024, NVIDIA CORPORATION.  All rights reserved.
- * Copyright (c) 2021, NAVER Corp.  Authored by CLOVA.
+ * Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,23 +16,17 @@
 
 #pragma once
 
-#include <curand_kernel.h>
-
-#include "tensorrt_llm/common/tensor.h"
-#include "tensorrt_llm/executor/types.h"
 #include "tensorrt_llm/layers/baseLayer.h"
 #include "tensorrt_llm/layers/decodingParams.h"
 #include "tensorrt_llm/runtime/common.h"
-#include "tensorrt_llm/runtime/iTensor.h"
 
-namespace tc = tensorrt_llm::common;
+#include <curand_kernel.h>
 
-namespace tensorrt_llm
-{
-namespace layers
+namespace tensorrt_llm::layers
 {
 
-//! \brief
+//! \brief Decoding layer for speculative decoding technique, when all tokens are generated, decoded and accepted in the
+//! engine.
 template <typename T>
 class ExplicitDraftTokensLayer : public BaseLayer
 {
@@ -41,27 +34,48 @@ public:
     using Base = BaseLayer;
     using PathsVec = std::vector<std::vector<std::vector<runtime::SizeType32>>>;
 
-    ExplicitDraftTokensLayer(DecoderDomain const& decoderDomain, cudaStream_t stream,
-        std::shared_ptr<tensorrt_llm::common::IAllocator> allocator);
+    ExplicitDraftTokensLayer(DecoderDomain const& decoderDomain, std::shared_ptr<runtime::BufferManager> bufferManager);
 
-    ~ExplicitDraftTokensLayer() override;
+    void setup(runtime::SizeType32 batchSize, runtime::SizeType32 beamWidth, BufferConstPtr batchSlots,
+        std::shared_ptr<BaseSetupParams> const& setupParams) override;
 
-    void setup(runtime::SizeType32 batchSize, runtime::SizeType32 beamWidth, runtime::SizeType32 const* batchSlots,
-        std::shared_ptr<BaseSetupParams> setupParams) override;
+    void forwardAsync(std::shared_ptr<BaseDecodingOutputs> const& outputs,
+        std::shared_ptr<BaseDecodingInputs> const& inputs) override;
 
-    void forwardAsync(std::shared_ptr<BaseOutputParams> outputs, std::shared_ptr<BaseInputParams> inputs) override;
+    //! @returns workspace needed for this layer in bytes
+    [[nodiscard]] size_t getWorkspaceSize() const noexcept override;
 
 private:
     void allocateBuffer();
-    void freeBuffer();
+
+    void fillContextBuffers(
+        SizeType32 batchSize, BufferConstPtr batchSlots, ExplicitDraftTokensSetupParams const& params);
+
+    void convertPackedMask(ExplicitDraftTokensOutputs const& outputs, ExplicitDraftTokensInputs const& inputs);
+
+    void splitInputDataToBatchSlots(ExplicitDraftTokensOutputs const& outputs, ExplicitDraftTokensInputs const& inputs);
+
+    void packAcceptedPaths(ExplicitDraftTokensOutputs const& outputs, ExplicitDraftTokensInputs const& inputs);
 
 private:
-    using Base::mStream;
-    using Base::mAllocator;
-    using Base::mWorkspaceSize;
-
     using Base::mDecoderDomain;
+
+    SizeType32 mNumPaths;
+    SizeType32 mMaxPathLength;
+
+    size_t mScanWorkspaceSizeInBytes{0};
+    size_t mReduceWorkspaceSizeInBytes{0};
+
+    TensorPtr mRandomSeedsDevice;
+    TensorPtr mCurandStatesDevice;
+    BufferPtr mWorkspaceDevice;
+    TensorPtr mGenerationLengthInclusiveSum;
+    TensorPtr mMaxGenerationLength;
+    TensorPtr mTemperatureDevice;
+    TensorPtr mBestPathIndicesSlots;
+    TensorPtr mLastDraftIndicesSlots;
+
+    TensorPtr mTemperature;
 };
 
-} // namespace layers
-} // namespace tensorrt_llm
+} // namespace tensorrt_llm::layers

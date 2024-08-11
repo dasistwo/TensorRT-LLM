@@ -4,7 +4,7 @@
 
 TensorRT-LLM relies on a component, called the Batch Manager, to support
 in-flight batching of requests (also known in the community as continuous
-batching or iteration-level batching). That technique that aims at reducing
+batching or iteration-level batching). That technique aims at reducing
 wait times in queues, eliminating the need for padding requests and allowing
 for higher GPU utilization.
 
@@ -119,16 +119,18 @@ When using V1 batching, the following additional statistics are reported per V1 
 
 ### Logits Post-Processor (optional)
 
-Users can alter the logits produced the network, with a callback attached to an `InferenceRequest`:
+Users can alter the logits produced by the network, with a callback attached to an `InferenceRequest`:
 
 ```
-  using LogitsPostProcessor = std::function<TensorPtr(RequestIdType, TensorPtr&, BeamTokens const&, TStream)>;
+  using LogitsPostProcessor = std::function<TensorPtr(RequestIdType, TensorPtr&, BeamTokens const&, TStream const&, std::optional<RequestIdType>)>;
 ```
 
-The first argument is the request id, second is the logits tensor, third are the tokens produced by the request so far, and last one is the operation stream used by the logits tensor.
+The first argument is the request id, second is the logits tensor, third are the tokens produced by the request so far, fourth is the operation stream used by the logits tensor, and last one is an optional client id.
 
-Users *must* use the stream to access the logits tensor. For example, performing a addition with a bias tensor should be enqueued on that stream.
+Users *must* use the stream to access the logits tensor. For example, performing an addition with a bias tensor should be enqueued on that stream.
 Alternatively, users may call `stream->synchronize()`, however, that will slow down the entire execution pipeline.
+
+Multiple requests can share same client id and callback can use different logic based on client id.
 
 Note: this feature isn't supported with the `V1` batching scheme for the moment.
 
@@ -171,7 +173,7 @@ The responses from `SendResponseCallback` are stored in a `std::shared_ptr<Tenso
 [1, beamWidth, maxSeqLength].
 * sequence length: a CPU tensor that indicates the length of inputID + outputID. Its shape is [1, 1].
 * context logits: a CPU tensor that contains context logits. Its shape is [1, promptLength, vocabSizePadded] if the engine is built with `gather_context_logits` or `gather_all_token_logits`. Otherwise, it is a dummy tensor with shape [1, 1, 1].
-* generation logits:  a CPU tensor that contains generation logits. Its shape is [1, beamWidth, outputLength, vocabSizePadded]. if the engine is built with `gather_generation_logits` or `gather_all_token_logits`. Otherwise, it is a dummy tensor with shape [1, 1, 1, 1]. If you are using gptManagerBenchmark.cpp, please remember to pass corresponding parameters `--return-context-logits` and/or `--return-generation-logits` to obtain these logits. Note that enabling return logits will require more device memory for converting and storing logits. To reduce redundant memory buffer allocation as much as possible, we recommend that the `max_batch_size`, `max_beam_width`, `max_input_len`, `max_output_len`, and other parameters set when building the engine are close to the values required during actual inference.
+* generation logits:  a CPU tensor that contains generation logits. Its shape is [1, beamWidth, outputLength, vocabSizePadded]. if the engine is built with `gather_generation_logits` or `gather_all_token_logits`. Otherwise, it is a dummy tensor with shape [1, 1, 1, 1]. If you are using gptManagerBenchmark.cpp, please remember to pass corresponding parameters `--return-context-logits` and/or `--return-generation-logits` to obtain these logits. Note that enabling return logits will require more device memory for converting and storing logits. To reduce redundant memory buffer allocation as much as possible, we recommend that the `max_batch_size`, `max_beam_width`, `max_input_len`, `max_seq_len`, and other parameters set when building the engine are close to the values required during actual inference.
 
 * logProb: a CPU tensor that stores the log-prob of the generated tokens. Its shape is [1, beamWidth, outputLength]
 * cumLogProb: a CPU tensor that stores the cumLogProb. Its shape is [1, beamWidth]
@@ -244,5 +246,5 @@ results.
 
 A Triton Inference Server C++ backend is provided with TensorRT-LLM that
 includes the mechanisms needed to serve models using in-flight batching. That
-backend is also a good starting example how to implement in-flight batching using
+backend is also a good starting example of how to implement in-flight batching using
 the TensorRT-LLM batch manager.

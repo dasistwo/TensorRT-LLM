@@ -18,9 +18,11 @@
 #define TRT_MIXTURE_OF_EXPERTS_PLUGIN_H
 
 #include "NvInferPlugin.h"
+#include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/quantization.h"
 #include "tensorrt_llm/kernels/mixtureOfExperts/moe_kernels.h"
 #include "tensorrt_llm/plugins/common/plugin.h"
+#include "tensorrt_llm/runtime/cudaStream.h"
 #include <cassert>
 #include <set>
 #include <string>
@@ -29,33 +31,38 @@
 namespace tensorrt_llm::plugins
 {
 class MixtureOfExpertsGemmProfiler;
+using MOEParallelismConfig = tensorrt_llm::kernels::MOEParallelismConfig;
 using MixtureOfExpertsPluginProfilerPtr = std::shared_ptr<MixtureOfExpertsGemmProfiler>;
 
 struct GemmIDMoe
 {
+    int gemm_idx;
     int num_experts{};
     int moe_k{};
+    MOEParallelismConfig parallelism_config{};
     int64_t hidden{};
     int64_t inter{};
     tensorrt_llm::ActivationType actfn{};
     nvinfer1::DataType dtype{};
     nvinfer1::DataType wdtype{};
     tensorrt_llm::common::QuantMode quant_mode;
-    tensorrt_llm::kernels::MOEParallelismMode parallelism_mode{};
+    bool determinism_mode = false;
 
     bool operator==(GemmIDMoe const& id) const
     {
-        return id.num_experts == num_experts && id.moe_k == moe_k && id.hidden == hidden && id.inter == inter
+        return id.gemm_idx == gemm_idx && id.num_experts == num_experts && id.moe_k == moe_k
+            && id.parallelism_config == parallelism_config && id.hidden == hidden && id.inter == inter
             && id.actfn == actfn && id.dtype == dtype && id.wdtype == wdtype && id.quant_mode == quant_mode
-            && id.parallelism_mode == parallelism_mode;
+            && id.determinism_mode == determinism_mode;
     }
 
     friend std::ostream& operator<<(std::ostream& out, GemmIDMoe const& id)
     {
-        out << "experts, k, hidden, inter, actfn, dtype, weight type, parallelism mode=" << id.num_experts << ","
-            << id.moe_k << "," << id.hidden << "," << id.inter << "," << static_cast<int>(id.actfn) << ","
-            << static_cast<int>(id.dtype) << "," << static_cast<int>(id.wdtype) << "," << id.quant_mode.value() << ","
-            << static_cast<int>(id.parallelism_mode);
+        out << "gemm idx, experts, k, parallelism_config, hidden, inter, actfn, dtype, weight "
+               "type, parallelism mode, determinism mode="
+            << id.gemm_idx << "," << id.num_experts << "," << id.moe_k << "," << id.parallelism_config << ","
+            << id.hidden << "," << id.inter << "," << static_cast<int>(id.actfn) << "," << static_cast<int>(id.dtype)
+            << "," << static_cast<int>(id.wdtype) << "," << id.quant_mode.value() << "," << id.determinism_mode;
         return out;
     }
 };
@@ -65,15 +72,19 @@ struct GemmIDMoeHash
 {
     std::size_t operator()(GemmIDMoe const& id) const
     {
-        size_t hash = std::hash<int>{}(id.num_experts);
+        size_t hash = std::hash<int>{}(id.gemm_idx);
+        hash ^= std::hash<int>{}(id.num_experts);
         hash ^= std::hash<int>{}(id.moe_k);
+        hash ^= std::hash<int>{}(id.parallelism_config.tp_size);
+        hash ^= std::hash<int>{}(id.parallelism_config.ep_size);
+        hash ^= std::hash<int>{}(id.parallelism_config.tp_rank);
+        hash ^= std::hash<int>{}(id.parallelism_config.ep_rank);
         hash ^= std::hash<int>{}(id.hidden);
         hash ^= std::hash<int>{}(id.inter);
         hash ^= std::hash<int>{}(static_cast<int>(id.actfn));
         hash ^= std::hash<int>{}(static_cast<int>(id.dtype));
         hash ^= std::hash<int>{}(static_cast<int>(id.wdtype));
         hash ^= std::hash<int>{}(static_cast<int>(id.quant_mode.value()));
-        hash ^= std::hash<int>{}(static_cast<int>(id.parallelism_mode));
         return hash;
     }
 };
@@ -81,16 +92,16 @@ struct GemmIDMoeHash
 class MixtureOfExpertsPlugin : public nvinfer1::IPluginV2DynamicExt
 {
 public:
-    using MOEParallelismMode = tensorrt_llm::kernels::MOEParallelismMode;
+    using MOEParallelismConfig = tensorrt_llm::kernels::MOEParallelismConfig;
     using MOEExpertScaleNormalizationMode = tensorrt_llm::kernels::MOEExpertScaleNormalizationMode;
 
     MixtureOfExpertsPlugin() = delete;
     MixtureOfExpertsPlugin(int number_of_experts, int top_k, int expert_hidden_size, int expert_inter_size,
         tensorrt_llm::ActivationType activation_type, nvinfer1::DataType type, nvinfer1::DataType weight_type,
         nvinfer1::DataType output_type, tensorrt_llm::common::QuantMode quant_mode, bool use_finished, bool use_bias,
-        int tp_size, int tp_rank, MOEParallelismMode parallelism_mode,
-        MOEExpertScaleNormalizationMode normalization_mode, MixtureOfExpertsPluginProfilerPtr plugin_profiler_ptr);
-    MixtureOfExpertsPlugin(void const* data, size_t length, MixtureOfExpertsPluginProfilerPtr plugin_profiler_ptr);
+        int tp_size, int tp_rank, int ep_size, int ep_rank, MOEExpertScaleNormalizationMode normalization_mode,
+        bool force_determinism, MixtureOfExpertsPluginProfilerPtr gemm_profiler_ptr);
+    MixtureOfExpertsPlugin(void const* data, size_t length, MixtureOfExpertsPluginProfilerPtr gemm_profiler_ptr);
     MixtureOfExpertsPlugin(MixtureOfExpertsPlugin const&);
 
     void init();
@@ -145,19 +156,19 @@ private:
     tensorrt_llm::common::QuantMode mQuantMode;
     bool mUseFinished{};
     bool mUseBias{};
-    int mTPSize{};
-    int mTPRank{};
-    MOEParallelismMode mParallelismMode{};
+    MOEParallelismConfig mParallelismConfig{};
     MOEExpertScaleNormalizationMode mNormalizationMode{};
 
     GemmDims mDims{};
+    bool mUseDeterministicKernels = false;
+
+    GemmIDMoe mGemmId1{};
+    GemmIDMoe mGemmId2{};
+
+    MixtureOfExpertsPluginProfilerPtr mGemmProfiler;
 
     // The below are not serialised
-    GemmIDMoe mGemmId{};
-
-    MixtureOfExpertsPluginProfilerPtr mPluginProfiler;
-
-    const std::string mLayerName{};
+    std::string const mLayerName{};
     std::string mNamespace{};
 
     struct WorkspaceInfo
@@ -319,14 +330,38 @@ public:
         // NOTE: Do not access mPlugin here, since we are called from the constructor before all fields are init
     }
 
+    void setGemmToProfile(tensorrt_llm::kernels::GemmProfilerBackend::GemmToProfile gemm_to_profile)
+    {
+        // Just set the backend directly. This will just be reused in checkInit().
+        backend.mGemmToProfile = gemm_to_profile;
+        // We need to set the backend to reinitialise itself with the new GEMM
+        init_backend = false;
+    }
+
+    void setMaxProfileM(int maxProfileM)
+    {
+        mMaxProfileM = maxProfileM;
+    }
+
+    virtual int getMaxProfileM() const override
+    {
+        return mMaxProfileM;
+    }
+
 protected:
     using Config = tensorrt_llm::cutlass_extensions::CutlassGemmConfig;
     void runTactic(int m, int n, int k, Config const& tactic, char* workspace, cudaStream_t const& stream) override;
-    void computeTmpSize(int maxM, int n, int k) override;
+    void computeTmpSize(size_t maxM, size_t n, size_t k) override;
     std::vector<Config> getTactics(int m, int n, int k) const override;
     void initTmpData(int maxM, int n, int k, char* workspace, size_t size, cudaStream_t stream) override;
 
-    std::vector<size_t> getProfilerWorkspaces(int maxM);
+    void checkInit();
+
+    bool init_backend = false;
+    tensorrt_llm::kernels::GemmProfilerBackend backend{};
+
+private:
+    int mMaxProfileM = 0;
 };
 
 class MixtureOfExpertsPluginCreator : public nvinfer1::IPluginCreator

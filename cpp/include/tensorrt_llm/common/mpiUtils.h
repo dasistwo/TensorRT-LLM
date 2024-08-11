@@ -18,6 +18,7 @@
 
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/runtime/utils/multiDeviceUtils.h"
+#include <limits>
 
 #ifdef ENABLE_FP8
 #include <cuda_fp8.h>
@@ -258,10 +259,24 @@ public:
     static MpiComm const& world();
 
     //! \brief Corresponds to `world()` by default, but can be overridden per process.
-    static MpiComm& session();
+    static MpiComm const& session()
+    {
+        return mutableSession();
+    }
 
     //! \brief Returns the MPI local communicator.
-    static MpiComm& localSession();
+    static MpiComm const& localSession()
+    {
+        return mutableLocalSession();
+    }
+
+    static MpiComm const& setSession(MpiComm comm)
+    {
+        auto& session = mutableSession();
+        session = std::move(comm);
+        refreshLocalSession();
+        return session;
+    }
 
     [[nodiscard]] MpiComm split(int color, int key) const;
 
@@ -293,15 +308,31 @@ public:
         auto vecSize = (rank == root) ? static_cast<int64_t>(vec.size()) : int64_t(0);
         bcast(&vecSize, 1, MpiType::kINT64, root);
         vec.resize(vecSize);
+        if (vec.empty())
+        {
+            return;
+        }
 
+        size_t bcastSize = vec.size() * sizeof(T);
         if constexpr (std::is_fundamental_v<std::remove_cv_t<T>>)
         {
-            auto const mpiType = MpiTypeConverter<std::remove_cv_t<T>>::value;
-            bcast(vec.data(), vec.size(), mpiType, root);
+            bcastSize = vec.size();
         }
-        else
+
+        // To prevent overflowing int32_t limit
+        size_t const maxChunkSize = std::numeric_limits<int32_t>::max();
+        for (size_t pos = 0; pos < bcastSize; pos += maxChunkSize)
         {
-            bcast(vec.data(), vec.size() * sizeof(T), MpiType::kBYTE, root);
+            auto chunkSize = std::min(bcastSize - pos, maxChunkSize);
+            auto intChunkSize = static_cast<int>(chunkSize);
+            if constexpr (std::is_fundamental_v<std::remove_cv_t<T>>)
+            {
+                bcast(vec.data() + pos, intChunkSize, MpiTypeConverter<std::remove_cv_t<T>>::value, root);
+            }
+            else
+            {
+                bcast(reinterpret_cast<char*>(vec.data()) + pos, intChunkSize, MpiType::kBYTE, root);
+            }
         }
     }
 
@@ -364,11 +395,21 @@ public:
     }
 
 private:
+    //! \brief Corresponds to `world()` by default, but can be overridden per process.
+    static MpiComm& mutableSession();
+
+    //! \brief Returns the MPI local communicator.
+    static MpiComm& mutableLocalSession();
+
+    static void refreshLocalSession();
+
     MPI_Comm mComm;
     bool mFreeComm;
 };
 
-void initialize(MpiThreadSupport threadMode = MpiThreadSupport::THREAD_FUNNELED);
+std::vector<int> getWorldRanks(MpiComm const& comm);
+
+void initialize(MpiThreadSupport threadMode = MpiThreadSupport::THREAD_MULTIPLE, bool forwardAbortToParent = false);
 
 } // namespace tensorrt_llm::mpi
 

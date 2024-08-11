@@ -17,6 +17,7 @@
 #pragma once
 
 #include <cassert>
+#include <iostream>
 #include <sstream>
 #include <string>
 
@@ -59,13 +60,18 @@ enum class CutlassTileConfig
     CtaShape256x128x64_WarpShape64x64x64,
 
     // TensorCore config CTA_N = 256, CTA_K = 64
-    CtaShape16x256x64_WarpShape16x64x64
+    CtaShape16x256x64_WarpShape16x64x64,
+
+    // TensorCore config CTA_N = 256, CTA_K = 128
+    CtaShape16x256x128_WarpShape16x64x128
+
 };
 
 enum class SplitKStyle
 {
     NO_SPLIT_K,
     SPLIT_K_SERIAL,
+    STREAM_K, // Sm80+
     // SPLIT_K_PARALLEL // Not supported yet
 };
 
@@ -91,6 +97,8 @@ enum class CutlassTileConfigSM90
     CtaShape128x128x128B,
     CtaShape128x256x128B,
 
+    // CTA configs for M=128
+    CtaShape256x128x128B,
 };
 
 enum class MainloopScheduleType
@@ -110,7 +118,9 @@ enum class ClusterShape
     ClusterShape_1x1x1,
     ClusterShape_2x1x1,
     ClusterShape_1x2x1,
-    ClusterShape_2x2x1
+    ClusterShape_2x2x1,
+    ClusterShape_1x8x1,
+    ClusterShape_8x1x1
 };
 
 struct CutlassGemmConfig
@@ -123,6 +133,7 @@ struct CutlassGemmConfig
         INT8_ONLY = 1u << 2,
         HOPPER = 1u << 3,
         GROUPED_GEMM = 1u << 4,
+        FP8_ONLY = 1u << 5,
     };
 
     CutlassTileConfig tile_config = CutlassTileConfig::ChooseWithHeuristic;
@@ -160,7 +171,7 @@ struct CutlassGemmConfig
     {
     }
 
-    std::string toString()
+    std::string toString() const
     {
         std::stringstream tactic;
         tactic << "Cutlass GEMM Tactic";
@@ -186,6 +197,27 @@ struct CutlassGemmConfig
         return tactic.str();
     }
 };
+
+inline std::ostream& operator<<(std::ostream& out, CutlassGemmConfig const& config)
+{
+    // clang-format off
+    if (config.is_sm90)
+    {
+        out << "tile_config_sm90_enum: " << int(config.tile_config_sm90)
+            << ", mainloop_schedule_enum: " << int(config.mainloop_schedule)
+            << ", epilogue_schedule_enum: " << int(config.epilogue_schedule)
+            << ", cluster_shape_enum: " << int(config.cluster_shape);
+    }
+    else
+    {
+        out << "tile_config_enum: " << int(config.tile_config)
+            << ", split_k_style_enum: " << int(config.split_k_style)
+            << ", split_k_factor: " << config.split_k_factor
+            << ", stages: " << config.stages;
+    }
+    // clang-format on
+    return out;
+}
 
 } // namespace cutlass_extensions
 } // namespace tensorrt_llm

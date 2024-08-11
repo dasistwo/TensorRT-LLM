@@ -60,6 +60,7 @@ auto constexpr kReturnGenerationLogitsTensorName = "return_generation_logits";
 auto constexpr kPromptEmbeddingTableName = "prompt_embedding_table";
 auto constexpr kPromptVocabSizeName = "prompt_vocab_size";
 auto constexpr kLoraTaskId = "lora_task_id";
+auto constexpr kNoRepeatNgramSizeTensorName = "noRepeatNgramSize";
 // weights for a lora adapter shape [ num_lora_modules_layers, D x Hi + Ho x D ]
 // where the last dimension holds the in / out adapter weights for the associated module (e.g. attn_qkv) and model layer
 // each of the in / out tensors are first flattened and then concatenated together in the format above.
@@ -85,6 +86,7 @@ auto constexpr kLoraWeights = "lora_weights";
 // "moe_4h_to_h": 14 # for mixtral adapter for expert mlp layer: down projection
 // "moe_gate": 15    # for mixtral adapter for expert mlp layer: gate
 // "moe_router": 16  # for mixtral adapter for expert router layer
+// "mlp_router": 17  # for qwen2-moe adapter for shared expert gate layer
 //
 // last dim holds [ module_id, layer_idx, adapter_size (D / R value) ]
 auto constexpr kLoraConfig = "lora_config"; // [num_lora_modules_layers, 3]
@@ -115,7 +117,7 @@ public:
         uint64_t requestId, std::optional<LogitsPostProcessor> logitsPostProcessor = std::nullopt)
         : mRequestId{requestId}
         , mIsStreaming{false}
-        , mlogitsPostProcessor(logitsPostProcessor)
+        , mLogitsPostProcessor(logitsPostProcessor)
     {
     }
 
@@ -124,7 +126,7 @@ public:
         : mRequestId{requestId}
         , mIsStreaming{false}
         , mInputTensors{std::move(tensorMap)}
-        , mlogitsPostProcessor(logitsPostProcessor)
+        , mLogitsPostProcessor(logitsPostProcessor)
     {
         for (auto const& [name, tensor] : mInputTensors)
         {
@@ -160,12 +162,12 @@ public:
 
     void setLogitsPostProcessor(std::optional<LogitsPostProcessor> cb)
     {
-        mlogitsPostProcessor = cb;
+        mLogitsPostProcessor = cb;
     }
 
     std::optional<LogitsPostProcessor> getLogitsPostProcessor()
     {
-        return mlogitsPostProcessor;
+        return mLogitsPostProcessor;
     }
 
     static std::array constexpr kTensorNames = {
@@ -194,6 +196,7 @@ public:
         inference_request::kReturnGenerationLogitsTensorName,
         inference_request::kPromptEmbeddingTableName,
         inference_request::kPromptVocabSizeName,
+        inference_request::kNoRepeatNgramSizeTensorName,
         // obsolete names for backward compatibility
         inference_request::kInputLengthsTensorName,
         inference_request::kLoraTaskId,
@@ -264,6 +267,7 @@ public:
     TENSOR_GETTER_SETTER(LoraTaskId, inference_request::kLoraTaskId)
     TENSOR_GETTER_SETTER(LoraWeights, inference_request::kLoraWeights)
     TENSOR_GETTER_SETTER(LoraConfig, inference_request::kLoraConfig)
+    TENSOR_GETTER_SETTER(NoRepeatNgramSize, inference_request::kNoRepeatNgramSizeTensorName)
 
 #undef TENSOR_GETTER_SETTER
 
@@ -277,7 +281,7 @@ protected:
     uint64_t mRequestId;
     bool mIsStreaming;
     TensorMap mInputTensors;
-    std::optional<LogitsPostProcessor> mlogitsPostProcessor;
+    std::optional<LogitsPostProcessor> mLogitsPostProcessor;
 };
 
 class InferenceRequest : public GenericInferenceRequest<tensorrt_llm::runtime::ITensor::SharedPtr, NamedTensor>

@@ -11,6 +11,7 @@ from parameterized import parameterized
 import tensorrt_llm
 from tensorrt_llm._utils import torch_dtype_to_trt, trt_dtype_to_torch
 from tensorrt_llm.plugin.plugin import ContextFMHAType
+from tensorrt_llm.quantization import QuantMode
 from tensorrt_llm.runtime import TensorInfo
 
 
@@ -149,13 +150,41 @@ def unittest_name_func(testcase_func, param_num, param):
     )
 
 
+def set_input_shape(profile,
+                    inp: tensorrt_llm.Tensor,
+                    shape: tuple,
+                    data: torch.Tensor = None):
+    set_input_shapes(profile, inp, shape, shape, shape, data)
+    return
+
+
+def set_input_shapes(profile,
+                     inp: tensorrt_llm.Tensor,
+                     min_shape: tuple,
+                     opt_shape: tuple,
+                     max_shape: tuple,
+                     data: torch.Tensor = None):
+    if inp.trt_tensor.is_shape_tensor:
+        # For shape tensors, TensorRT expects the full tensor (on CPU), not just shape
+        assert data is not None, f"For shape tensor {inp.name}, TensorRT needs the tensor value."
+        assert str(data.device) == "cpu", f"Shape tensor's data needs to be on CPU " \
+            f"(device found={data.device}) for both updating the profile and for execution."
+        np_data = data.flatten().numpy()
+        profile.set_shape_input(inp.name, np_data, np_data, np_data)
+        return
+    profile.set_shape(inp.name, min_shape, opt_shape, max_shape)
+    return
+
+
 def create_session(builder,
                    network,
                    precision="float32",
                    int8=False,
+                   fp8=False,
                    opt_level=None,
                    memory_pool_limit=None,
-                   optimization_profiles=[]):
+                   optimization_profiles=[],
+                   quant_mode=QuantMode(0)):
     """
     This function creates an engine and a tensorrt_llm.runtime.Session for the engine.
     Args:
@@ -167,7 +196,9 @@ def create_session(builder,
     """
     builder_config = builder.create_builder_config(precision=precision,
                                                    int8=int8,
-                                                   opt_level=opt_level)
+                                                   fp8=fp8,
+                                                   opt_level=opt_level,
+                                                   quant_mode=quant_mode)
     # Some tests require to set mem pool limit to avoid OOM
     if memory_pool_limit is not None:
         builder_config.trt_builder_config.set_memory_pool_limit(
@@ -176,30 +207,40 @@ def create_session(builder,
     if len(optimization_profiles) > 0:
         for profile in optimization_profiles:
             builder_config.trt_builder_config.add_optimization_profile(profile)
+    # Disable TF32 for accuracy in testing.
+    builder_config.trt_builder_config.clear_flag(trt.BuilderFlag.TF32)
     engine = builder.build_engine(network, builder_config)
     assert engine is not None, "Failed to build engine"
     session = tensorrt_llm.runtime.Session.from_serialized_engine(engine)
     return session
 
 
-def run_session(session, inputs):
+def run_session(session, inputs, outputs={}, override_shapes={}):
     """
     The current session object needs to pass in both inputs and outputs bindings.
     For test convenience, create a function that infers output shapes automatically,
     This function is similar to tensorrt_llm.runtime.Session._debug_run, and Polygraphy runner.infer,
     where only input shape is required.
+    NOTES:
+        1. The outputs dictionary is required for outputs for which the shapes cannot be inferred.
+           This function will prioritize to use the tensor in this dictionary.
+        2. `override_shapes` can be used to force some input tensors' shape to be different than the passed tensor.
+           Required for zero-volume tensors since torch.Tensor.data_ptr() is nullptr for such tensors.
     """
 
     # Prepare output tensors.
     output_info = session.infer_shapes([
-        TensorInfo(name, torch_dtype_to_trt(tensor.dtype), tensor.shape)
+        TensorInfo(
+            name, torch_dtype_to_trt(tensor.dtype), tensor.shape
+            if name not in override_shapes else override_shapes[name])
         for name, tensor in inputs.items()
     ])
 
     outputs = {
-        t.name: torch.empty(tuple(t.shape),
-                            dtype=trt_dtype_to_torch(t.dtype),
-                            device='cuda')
+        t.name:
+        torch.empty(tuple(t.shape),
+                    dtype=trt_dtype_to_torch(t.dtype),
+                    device='cuda') if t.name not in outputs else outputs[t.name]
         for t in output_info
     }
 

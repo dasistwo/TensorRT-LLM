@@ -16,6 +16,7 @@
 #include "tllmRuntime.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/logger.h"
+#include "tensorrt_llm/common/mpiUtils.h"
 #include "tensorrt_llm/common/nvtxUtils.h"
 #include "tllmLogger.h"
 
@@ -57,40 +58,85 @@ std::vector<std::size_t> dimsToShape(nvinfer1::Dims const& dims)
 
 tensorrt_llm::runtime::TllmLogger defaultLogger{};
 
+class StreamReader final : public nvinfer1::IStreamReader
+{
+public:
+    StreamReader(std::filesystem::path fp)
+    {
+        mFile.open(fp.string(), std::ios::binary | std::ios::in);
+        TLLM_CHECK_WITH_INFO(mFile.good(), std::string("Error opening engine file: " + fp.string()));
+    }
+
+    virtual ~StreamReader()
+    {
+        if (mFile.is_open())
+        {
+            mFile.close();
+        }
+    }
+
+    int64_t read(void* destination, int64_t nbBytes) final
+    {
+        if (!mFile.good())
+        {
+            return -1;
+        }
+        mFile.read(static_cast<char*>(destination), nbBytes);
+        return mFile.gcount();
+    }
+
+    std::ifstream mFile;
+};
+
+void setWeightStreaming(nvinfer1::ICudaEngine& engine, float const gpuWeightsPercent)
+{
+    if (gpuWeightsPercent < 1)
+    {
+        int64_t streamableSize = engine.getStreamableWeightsSize();
+        int64_t budget = gpuWeightsPercent * streamableSize;
+        TLLM_LOG_INFO("Set gpu weights percent to %f, which is %lld bytes. Valid range: %lld bytes - %lld bytes.",
+            gpuWeightsPercent, budget, 0, streamableSize);
+        engine.setWeightStreamingBudgetV2(budget);
+    }
+}
 } // namespace
 
 TllmRuntime::TllmRuntime(
-    void const* engineData, std::size_t engineSize, float const gpuWeightsPercent, nvinfer1::ILogger& logger)
+    RawEngine const& rawEngine, nvinfer1::ILogger* logger, float gpuWeightsPercent, bool useShapeInference)
     : mStream(std::make_shared<CudaStream>())
     , mBufferManager{mStream, true} // Ensure to trim the memory pool on destruction.
-    , mRuntime{nvinfer1::createInferRuntime(logger)}
-    , mEngine{mRuntime->deserializeCudaEngine(engineData, engineSize)}
-    , mEngineInspector{mEngine->createEngineInspector()}
+    , mRuntime{nvinfer1::createInferRuntime(logger ? *logger : defaultLogger)}
+    , mUseShapeInference{useShapeInference}
 {
-    TLLM_CHECK_WITH_INFO(mEngine != nullptr, "Failed to deserialize cuda engine");
-    if (gpuWeightsPercent < 1)
+    switch (rawEngine.getType())
     {
-#if NV_TENSORRT_MAJOR >= 10
-        int64_t min = mEngine->getMinimumWeightStreamingBudget();
-        int64_t max = mEngine->getStreamableWeightsSize();
-        int64_t budget = min + gpuWeightsPercent * (max - min);
-        TLLM_LOG_INFO("Set gpu weights percent to %f, which is %lld bytes. Valid range: %lld bytes - %lld bytes.",
-            gpuWeightsPercent, budget, min, max);
-        mEngine->setWeightStreamingBudget(budget);
-#else
-        TLLM_THROW("Weight streaming is only supported with TensorRT 10.0 or later.");
-#endif // NV_TENSORRT_MAJOR >= 10
+    case RawEngine::Type::FilePath:
+    {
+        auto reader = StreamReader(rawEngine.getPath());
+        mEngine.reset(mRuntime->deserializeCudaEngine(reader));
+        break;
     }
-    auto const devMemorySize = mEngine->getDeviceMemorySize();
+    case RawEngine::Type::AddressWithSize:
+        mEngine.reset(mRuntime->deserializeCudaEngine(rawEngine.getAddress(), rawEngine.getSize()));
+        break;
+    case RawEngine::Type::HostMemory:
+        mEngine.reset(
+            mRuntime->deserializeCudaEngine(rawEngine.getHostMemory()->data(), rawEngine.getHostMemory()->size()));
+        break;
+    default: TLLM_THROW("Unsupported raw engine type.");
+    }
+
+    TLLM_CHECK_WITH_INFO(mEngine != nullptr, "Failed to deserialize cuda engine.");
+    mEngineInspector.reset(mEngine->createEngineInspector());
+
+    setWeightStreaming(getEngine(), gpuWeightsPercent);
+
+    auto const devMemorySize = mEngine->getDeviceMemorySizeV2();
     mEngineBuffer = mBufferManager.gpu(devMemorySize);
 
     // Print context memory size for CI/CD to track.
-    TLLM_LOG_INFO("Allocated %.2f MiB for execution context memory.", static_cast<double>(devMemorySize) / 1048576.0);
-}
-
-TllmRuntime::TllmRuntime(void const* engineData, std::size_t engineSize, float const gpuWeightsPercent = 1.0F)
-    : TllmRuntime{engineData, engineSize, gpuWeightsPercent, defaultLogger}
-{
+    TLLM_LOG_INFO("[MemUsageChange] Allocated %.2f MiB for execution context memory.",
+        static_cast<double>(devMemorySize) / 1048576.0);
 }
 
 nvinfer1::IExecutionContext& TllmRuntime::addContext(std::int32_t profileIndex)
@@ -99,19 +145,17 @@ nvinfer1::IExecutionContext& TllmRuntime::addContext(std::int32_t profileIndex)
     mContexts.emplace_back(mEngine->createExecutionContextWithoutDeviceMemory());
     if (!mContexts.back())
     {
-#if NV_TENSORRT_MAJOR >= 10
         if (mEngine->getStreamableWeightsSize() > 0)
         {
             TLLM_THROW("Failed to allocate memory for weights. Please try reducing --gpu_weights_percent.");
         }
         else
-#endif // NV_TENSORRT_MAJOR >= 10
         {
             TLLM_THROW("Internal Error: Failed to create an execution context.");
         }
     }
     auto& context = *mContexts.back();
-    context.setDeviceMemory(mEngineBuffer->data());
+    context.setDeviceMemoryV2(mEngineBuffer->data(), static_cast<int64_t>(mEngineBuffer->getCapacity()));
     context.setOptimizationProfileAsync(profileIndex, mStream->get());
     // If nvtx verbosity is DETAILED, print an info about potential perf overhead.
     if (context.getNvtxVerbosity() == nvinfer1::ProfilingVerbosity::kDETAILED)
@@ -140,6 +184,7 @@ bool TllmRuntime::executeContext(SizeType32 contextIndex) const
 
 void TllmRuntime::setInputTensors(SizeType32 contextIndex, TensorMap const& tensorMap)
 {
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     NVTX3_FUNC_RANGE();
     auto& context = getContext(contextIndex);
     for (std::int32_t i = 0; i < mEngine->getNbIOTensors(); ++i)
@@ -192,6 +237,7 @@ void TllmRuntime::setInputTensors(SizeType32 contextIndex, TensorMap const& tens
         }
     }
 
+    if (mUseShapeInference)
     {
         NVTX3_SCOPED_RANGE(infer_shapes);
         char const* missing;
@@ -211,10 +257,12 @@ void TllmRuntime::setInputTensors(SizeType32 contextIndex, TensorMap const& tens
         TLLM_CHECK_WITH_INFO(context.allInputDimensionsSpecified(), "Input dimensions not specified");
         TLLM_CHECK_WITH_INFO(context.allInputShapesSpecified(), "Input shapes not specified");
     }
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
 void TllmRuntime::setOutputTensors(SizeType32 contextIndex, TensorMap& tensorMap)
 {
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     NVTX3_FUNC_RANGE();
     auto& context = getContext(contextIndex);
     for (std::int32_t i = 0; i < mEngine->getNbIOTensors(); ++i)
@@ -222,7 +270,6 @@ void TllmRuntime::setOutputTensors(SizeType32 contextIndex, TensorMap& tensorMap
         auto const name = mEngine->getIOTensorName(i);
         if (mEngine->getTensorIOMode(name) == nvinfer1::TensorIOMode::kOUTPUT)
         {
-            auto const dims = context.getTensorShape(name);
             auto const engineDtype = mEngine->getTensorDataType(name);
             auto pos = tensorMap.find(name);
             if (pos != tensorMap.end())
@@ -235,17 +282,27 @@ void TllmRuntime::setOutputTensors(SizeType32 contextIndex, TensorMap& tensorMap
                     "%s: expected type %d, provided type %d", name, static_cast<std::int32_t>(engineDtype),
                     static_cast<std::int32_t>(tensorDtype));
 
-                tensor->reshape(dims);
+                if (mUseShapeInference)
+                {
+                    auto const dims = context.getTensorShape(name);
+                    tensor->reshape(dims);
+                }
                 context.setTensorAddress(name, tensor->data());
             }
-            else
+            else if (mUseShapeInference)
             {
+                auto const dims = context.getTensorShape(name);
                 auto tensor = ITensor::SharedPtr(mBufferManager.gpu(dims, engineDtype));
                 tensorMap.insert(pos, std::make_pair(name, tensor));
                 context.setTensorAddress(name, tensor->data());
             }
+            else
+            {
+                TLLM_THROW("Tensor %s is not found in tensorMap and shape inference is not allowed", name);
+            }
         }
     }
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
 CudaStream const& TllmRuntime::getStream() const

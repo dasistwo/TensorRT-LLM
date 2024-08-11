@@ -24,6 +24,7 @@ from transformers import AutoConfig, AutoModelForCausalLM
 import tensorrt_llm
 from tensorrt_llm._utils import (np_bfloat16, numpy_to_torch,
                                  str_dtype_to_torch, torch_to_numpy)
+from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.convert_utils import load_calib_dataset
 from tensorrt_llm.models.gemma.smoothquant import *
 from tensorrt_llm.models.gemma.weight import (dummy_weights_awq,
@@ -51,6 +52,12 @@ def parse_arguments():
         help=
         "help='Quantize weights for the various GEMMs to INT4/INT8. Define the precision for the weights.",
     )
+    parser.add_argument(
+        "--use-int8-weight-only-embedding",
+        action="store_true",
+        help=
+        "Use weight only on embedding table and lm_head. (Only supported on Hopper GPU)",
+    )
     parser.add_argument("--dtype",
                         type=str,
                         choices=["float32", "bfloat16", "float16"])
@@ -65,7 +72,7 @@ def parse_arguments():
         "By default, we use dtype for KV cache. fp8_kv_cache chooses fp8 quantization for KV",
     )
     parser.add_argument(
-        "--modelopt_quant_ckpt_path",
+        "--quant_ckpt_path",
         default=None,
         help=
         "Path of a directory to quantized model checkpoints in .safetensors format or \
@@ -357,6 +364,15 @@ class HfParser:
         config_new["num_heads"] = hf_config["num_attention_heads"]
         config_new["head_dim"] = hf_config["head_dim"]
         config_new["num_kv_heads"] = hf_config["num_key_value_heads"]
+        config_new['model_type'] = hf_config["model_type"]
+        if hf_config["model_type"] == "gemma2":
+            config_new["query_pre_attn_scalar"] = hf_config[
+                "query_pre_attn_scalar"]
+            config_new["final_logit_softcapping"] = hf_config[
+                "final_logit_softcapping"]
+            config_new["attn_logit_softcapping"] = hf_config[
+                "attn_logit_softcapping"]
+
         return EasyDict(config_new)
 
     def rename_to_trt_llm(self, name: str):
@@ -382,6 +398,10 @@ class HfParser:
              r"layers.\1.mlp.proj.weight"),
             (r"model.layers.(\d+).post_attention_layernorm.weight",
              r"layers.\1.post_layernorm.weight"),
+            (r"model.layers.(\d+).pre_feedforward_layernorm.weight",
+             r"layers.\1.pre_feedforward_layernorm.weight"),
+            (r"model.layers.(\d+).post_feedforward_layernorm.weight",
+             r"layers.\1.post_feedforward_layernorm.weight"),
             (r"model.norm.weight", r"ln_f.weight"),
         )
 
@@ -661,9 +681,9 @@ def convert_from_checkpoint(
                         add_trt_llm_weight(weights, trt_llm_name, qkv_param,
                                            trt_llm_config.dtype)
             elif "q_proj" in name:
-                gqa_mode = trt_llm_config.num_attention_heads != trt_llm_config.num_key_value_heads
+                mqa_mode = trt_llm_config.num_key_value_heads == 1
 
-                if gqa_mode:
+                if mqa_mode:
                     # initial shape: (num_heads * head_dim, hidden_size)
                     q_param = param
                     q_param = split_matrix_tp(q_param, tp_size, tp_rank, dim=0)
@@ -825,8 +845,8 @@ def convert_from_checkpoint(
                         tp_rank,
                         dim=trt_llm_config.embedding_sharding_dim,
                     )
-                if trt_llm_config.quant_mode.is_weight_only() and not trt_llm_config.quant_mode.has_per_group_scaling() and \
-                    not trt_llm_config.quant_mode.has_int8_kv_cache():
+                if trt_llm_config.quant_mode.is_int8_weight_only() and not trt_llm_config.quant_mode.has_per_group_scaling() and \
+                    not trt_llm_config.quant_mode.has_int8_kv_cache() and trt_llm_config.quantization.exclude_modules is not None:
 
                     # shape of embedding table: [V, K], V: vocab size, K: embedding dim
 
@@ -863,6 +883,8 @@ def convert_from_checkpoint(
                     "rms_normalization/vars/0",
                     "input_layernorm",
                     "post_attention_layernorm",
+                    "pre_feedforward_layernorm",
+                    "post_feedforward_layernorm",
                     "model.norm.weight",
             )):
                 param = param + 1.0  # upcasted to float32 in case of bfloat16
@@ -938,7 +960,7 @@ def convert(worker_rank, args, convert_kwargs):
             weight_scales = quantize_fp8_weights(
                 weights, trt_llm_config.num_hidden_layers,
                 trt_llm_config.mapping)
-            scales = load_from_fp8_gemma(args.modelopt_quant_ckpt_path,
+            scales = load_from_fp8_gemma(args.quant_ckpt_path,
                                          trt_llm_config.num_hidden_layers,
                                          trt_llm_config.mapping,
                                          args.fp8_kv_cache, weight_scales)
@@ -950,6 +972,10 @@ def convert(worker_rank, args, convert_kwargs):
 
 def main():
     args = parse_arguments()
+
+    # only support Tensor Parallelism for now
+    args.tp_size = args.world_size
+    args.pp_size = 1
 
     tik = time.time()
 
@@ -963,6 +989,7 @@ def main():
     ckpt_config = ckpt_parser.get_config(args.model_dir, ckpt_params, num_embed)
     # 2B TransformerConfig(num_layers=18, num_embed=256128, embed_dim=2048, hidden_dim=16384, num_heads=8, head_dim=256, num_kv_heads=1)
     # 7B TransformerConfig(...)
+    del ckpt_params
 
     print(f"Source configuration determined from parameters: {ckpt_config}")
 
@@ -1000,13 +1027,10 @@ def main():
     quant_kwargs.update(quant_algo=quant_algo,
                         kv_cache_quant_algo=kv_cache_quant_algo)
     if args.use_weight_only_with_precision:
-        if args.use_weight_only_with_precision.endswith("awq"):
-            quant_kwargs.update(has_zero_point=False,
-                                pre_quant_scale=True,
-                                exclude_modules=[
-                                    'lm_head', 'router', 'vocab_embedding',
-                                    'position_embedding', 'block_embedding'
-                                ])
+        if args.use_weight_only_with_precision.endswith(
+                "awq") or args.use_weight_only_with_precision.endswith(
+                    "int4") or not args.use_int8_weight_only_embedding:
+            quant_kwargs.update(has_zero_point=False, pre_quant_scale=True)
         else:
             quant_kwargs.update(exclude_modules=['router'])
 
@@ -1014,11 +1038,17 @@ def main():
     quant_config.quant_algo = quant_kwargs['quant_algo']
     quant_config.kv_cache_quant_algo = quant_kwargs['kv_cache_quant_algo']
     if args.use_weight_only_with_precision:
-        quant_config.exclude_modules = quant_kwargs['exclude_modules']
+        quant_config.exclude_modules = quant_kwargs.get('exclude_modules')
         if args.use_weight_only_with_precision.endswith("awq"):
             quant_config.group_size = 128
             quant_config.has_zero_point = quant_kwargs['has_zero_point']
             quant_config.pre_quant_scale = quant_kwargs['pre_quant_scale']
+
+    mapping = Mapping(
+        world_size=args.world_size,
+        tp_size=args.tp_size,
+        pp_size=args.pp_size,
+    )
 
     trt_llm_config = tensorrt_llm.models.modeling_utils.PretrainedConfig(
         architecture="GemmaForCausalLM",
@@ -1036,12 +1066,20 @@ def main():
         norm_epsilon=1e-6,  # hard-coded in RMSNorm from gemma/layers.py
         position_embedding_type="rope_gpt_neox",
         world_size=args.world_size,
-        tp_size=args.world_size,
-        pp_size=1,
+        mapping=mapping,
+        tp_size=args.tp_size,
+        pp_size=args.pp_size,
         gpus_per_node=8,
         quantization=quant_config,
+        use_parallel_embedding=args.tp_size > 1,
         share_embedding_table=args.use_embedding_sharing,
     )
+    if hasattr(ckpt_config,
+               "model_type") and ckpt_config.model_type == "gemma2":
+        trt_llm_config.inter_layernorms = True
+        trt_llm_config.final_logit_softcapping = ckpt_config.final_logit_softcapping
+        trt_llm_config.attn_logit_softcapping = ckpt_config.attn_logit_softcapping
+        trt_llm_config.query_pre_attn_scalar = ckpt_config.query_pre_attn_scalar
 
     trt_llm_config_dict = trt_llm_config.to_dict()
     print(f"Determined TensorRT-LLM configuration {trt_llm_config_dict}")

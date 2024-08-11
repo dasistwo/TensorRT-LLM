@@ -1282,6 +1282,8 @@ template <
     bool DO_MULTI_BLOCK = false,
     // Whether enable position shift for streamingllm
     bool POS_SHIFT = false,
+    // Whether to compute and apply block sparse attention mask
+    bool BLOCK_SPARSE_ATTN = false,
     // Whether compute implicit relative attention bias on the fly.
     bool IMPLICIT_REL_ATTN_BIAS = false,
     // Whether apply tanh scale to the qk product.
@@ -1305,7 +1307,6 @@ template <
 __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) masked_multihead_attention_kernel(
     Multihead_attention_params<T, DO_CROSS_ATTENTION> params, KVCacheBuffer kvCacheBuffer, KCacheBuffer pastKCache)
 {
-
     using Tk = typename kernel_type_t<T>::Type;
     // Use 8bit cache.
     static constexpr bool ENABLE_8BITS_K_CACHE = sizeof(TKcache) == 1;
@@ -1516,6 +1517,10 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
     convert_from_float(&k_scale_quant_orig, k_scale_quant_orig_f);
     convert_from_float(&kv_scale_orig_quant, (ENABLE_8BITS_KV_CACHE ? params.kv_scale_orig_quant[0] : 1.0f));
 
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    cudaGridDependencySynchronize();
+#endif
+
     // Up to QK_VECS_PER_Dh_MAX threads load Q and K + the bias values for the current timestep.
     // Trigger the loads from the Q and K buffers.
     Qk_vec_k q, k, q_bias, k_bias;
@@ -1528,6 +1533,10 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
     zero(k_wo_pos);
     float rotary_embedding_base = params.rotary_embedding_base;
     float rotary_embedding_scale = params.rotary_embedding_scale;
+    // Need to recompute the inv freq if it is dynamic scaling.
+    float const* rotary_embedding_inv_freq_cache = params.rotary_embedding_scale_type != RotaryScalingType::kDYNAMIC
+        ? params.rotary_embedding_inv_freq_cache
+        : nullptr;
     if (is_valid_qk_vec)
     {
         mmha::update_rotary_base_n_scale(rotary_embedding_base, rotary_embedding_scale,
@@ -1641,12 +1650,12 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
         if (HANDLE_KV)
         {
             apply_rotary_embedding(q, k, tidx, params.rotary_embedding_dim, rotary_embedding_base,
-                rotary_embedding_scale, 0, nullptr, current_pos_idx);
+                rotary_embedding_scale, current_pos_idx, rotary_embedding_inv_freq_cache);
         }
         else
         {
             apply_rotary_embedding(q, tidx, params.rotary_embedding_dim, rotary_embedding_base, rotary_embedding_scale,
-                0, nullptr, current_pos_idx);
+                current_pos_idx, rotary_embedding_inv_freq_cache);
         }
         break;
     }
@@ -1680,24 +1689,25 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
         constexpr int tidx_factor = (QK_VEC_SIZE > 1) ? QK_VEC_SIZE / 2 : 1;
         if (do_rotary)
         {
+            float rotary_embedding_m_scale = tlength <= params.rotary_embedding_original_max_positions
+                ? params.rotary_embedding_short_m_scale
+                : params.rotary_embedding_long_m_scale;
             mmha::vec_from_smem_transpose(q, q_smem_, transpose_idx, smem_pitch);
             if (HANDLE_KV)
             {
                 mmha::vec_from_smem_transpose(k, k_smem_, transpose_idx, smem_pitch);
 
                 mmha::apply_rotary_embedding(q, k, transpose_idx / tidx_factor, params.rotary_embedding_dim,
-                    rotary_embedding_base, rotary_embedding_scale, params.rotary_embedding_m_scale,
-                    params.rotary_embedding_scaling_factors, current_pos_idx, params.rotary_cogvlm_vision_start,
-                    params.rotary_cogvlm_vision_length);
+                    rotary_embedding_base, rotary_embedding_scale, current_pos_idx, rotary_embedding_inv_freq_cache,
+                    rotary_embedding_m_scale, params.rotary_cogvlm_vision_start, params.rotary_cogvlm_vision_length);
 
                 mmha::write_smem_transpose(k, k_smem_, transpose_idx, smem_pitch);
             }
             else
             {
                 mmha::apply_rotary_embedding(q, transpose_idx / tidx_factor, params.rotary_embedding_dim,
-                    rotary_embedding_base, rotary_embedding_scale, params.rotary_embedding_m_scale,
-                    params.rotary_embedding_scaling_factors, current_pos_idx, params.rotary_cogvlm_vision_start,
-                    params.rotary_cogvlm_vision_length);
+                    rotary_embedding_base, rotary_embedding_scale, current_pos_idx, rotary_embedding_inv_freq_cache,
+                    rotary_embedding_m_scale, params.rotary_cogvlm_vision_start, params.rotary_cogvlm_vision_length);
             }
             mmha::write_smem_transpose(q, q_smem_, transpose_idx, smem_pitch);
         }
@@ -2045,6 +2055,14 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
             // All the threads do the work even if it's not relevant to avoid divergence.
             qk_ += linear_bias_slope * (local_time_now - tlength) + relative_attention_bias;
 
+            if constexpr (BLOCK_SPARSE_ATTN)
+            {
+                float mask_val
+                    = params.block_sparse_params.computeMask(tlength, local_time_now, tlength + 1, num_heads, hi) ? 1.f
+                                                                                                                  : 0.f;
+                qk_ += (1.0f - mask_val) * -10000.0f;
+            }
+
             // There's one qk value per timestep.
             // Make sure only leader threads stores qk value within the bound.
             if (is_active && is_leader)
@@ -2176,6 +2194,13 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
             //
             // All the threads perform that step to avoid divergence.
             qk_ += linear_bias_slope * (time_now - tlength) + relative_attention_bias;
+
+            if constexpr (BLOCK_SPARSE_ATTN)
+            {
+                float mask_val
+                    = params.block_sparse_params.computeMask(tlength, time_now, tlength + 1, num_heads, hi) ? 1.f : 0.f;
+                qk_ += (1.0f - mask_val) * -10000.0f;
+            }
 
             // There's one qk value per timestep.
             // Make sure only leader threads stores qk value within the bound.
@@ -2642,7 +2667,7 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
                 // This makes sure we have coalesced memory access.
                 V_vec_k final_out;
                 convert_from_float(&final_out, out);
-                *reinterpret_cast<V_vec_k*>(&params.out[bhvi]) = final_out;
+                *reinterpret_cast<V_vec_k*>(static_cast<T*>(params.out) + bhvi) = final_out;
             }
         }
         else
@@ -2660,7 +2685,7 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
             convert_from_float(reinterpret_cast<float*>(&params.partial_sum[partial_stats_offset]), sum);
         }
 #else  // MMHA_USE_FP32_ACCUM_FOR_OUT
-        *reinterpret_cast<V_vec_accum*>(&params.out[bhvi]) = out;
+        *reinterpret_cast<V_vec_accum*>(static_cast<T*>(params.out) + bhvi) = out;
 #endif // MMHA_USE_FP32_ACCUM_FOR_OUT
     }
 
@@ -2818,7 +2843,7 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
                 }
                 else
                 {
-                    *reinterpret_cast<V_vec_k*>(&params.out[bhi * Dh + oi]) = thread_accumulated_out;
+                    *reinterpret_cast<V_vec_k*>(static_cast<T*>(params.out) + (bhi * Dh + oi)) = thread_accumulated_out;
                 }
             }
 
@@ -2830,6 +2855,10 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
         }
     }
 #endif // ENABLE_MULTI_BLOCK_OPTION
+
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    cudaTriggerProgrammaticLaunchCompletion();
+#endif
 }
 
 } // namespace mmha

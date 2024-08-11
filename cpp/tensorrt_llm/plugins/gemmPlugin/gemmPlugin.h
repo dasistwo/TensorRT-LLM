@@ -56,7 +56,7 @@ public:
 protected:
     void runTactic(int m, int n, int k, Config const& tactic, char* workspace, cudaStream_t const& stream) override;
 
-    void computeTmpSize(int maxM, int n, int k) override;
+    void computeTmpSize(size_t maxM, size_t n, size_t k) override;
 
     bool checkTactic(int m, int n, int k, Config const& tactic) const override;
 
@@ -79,7 +79,7 @@ public:
 
     GemmPlugin() = delete;
 
-    GemmPlugin(int transA, int transB, int padLda, int padLdb, nvinfer1::DataType type, bool useFp8,
+    GemmPlugin(int transA, int transB, int padLda, int padLdb, nvinfer1::DataType type, bool useFp8, float alpha,
         PluginProfilerPtr const& profiler);
 
     GemmPlugin(void const* data, size_t length, PluginProfilerPtr const& profiler);
@@ -135,6 +135,7 @@ private:
     GemmDims mDims{};
     GemmIdCublas mGemmId{};
     bool mUseFp8{false};
+    float mAlpha{1.f};
 
     PluginProfilerPtr mPluginProfiler;
 };

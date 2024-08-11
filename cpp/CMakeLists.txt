@@ -38,7 +38,9 @@ option(WARNING_IS_ERROR "Treat all warnings as errors" OFF)
 option(FAST_BUILD "Skip compiling some kernels to accelerate compiling" OFF)
 option(FAST_MATH "Compiling in fast math mode" OFF)
 option(INDEX_RANGE_CHECK "Compiling with index range checks" OFF)
-option(USE_SHARED_NVRTC "Use shared NVRTC library instead of static" OFF)
+
+# Always use static NVRTC for IP protection reasons.
+set(USE_SHARED_NVRTC OFF)
 
 if(NVTX_DISABLE)
   add_compile_definitions("NVTX_DISABLE")
@@ -128,6 +130,27 @@ if(INDEX_RANGE_CHECK)
   message(WARNING "Check index range to detect OOB accesses")
 endif()
 
+# Read the project version
+set(TRTLLM_VERSION_DIR ${PROJECT_SOURCE_DIR}/../tensorrt_llm)
+set_directory_properties(PROPERTIES CMAKE_CONFIGURE_DEPENDS
+                                    ${TRTLLM_VERSION_DIR}/version.py)
+execute_process(
+  COMMAND python3 -c "import version; print(version.__version__)"
+  WORKING_DIRECTORY ${TRTLLM_VERSION_DIR}
+  OUTPUT_VARIABLE TRTLLM_VERSION
+  RESULT_VARIABLE TRTLLM_VERSION_RESULT
+  OUTPUT_STRIP_TRAILING_WHITESPACE)
+
+if(TRTLLM_VERSION_RESULT EQUAL 0)
+  message(STATUS "TensorRT-LLM version: ${TRTLLM_VERSION}")
+else()
+  message(FATAL_ERROR "Failed to determine Tensorrt-LLM version")
+endif()
+
+configure_file(
+  cmake/templates/version.h
+  ${CMAKE_CURRENT_SOURCE_DIR}/include/tensorrt_llm/executor/version.h)
+
 # Determine CUDA version before enabling the language extension
 check_language(CUDA)
 if(CMAKE_CUDA_COMPILER)
@@ -139,7 +162,7 @@ if(CMAKE_CUDA_COMPILER)
         "${CMAKE_CUDA_COMPILER} --version | egrep -o 'V[0-9]+.[0-9]+.[0-9]+' | cut -c2-"
       RESULT_VARIABLE _BASH_SUCCESS
       OUTPUT_VARIABLE CMAKE_CUDA_COMPILER_VERSION
-      OUTPUT_STRIP_TRAILING_WHITESPACE)
+                      OUTPUT_STRIP_TRAILING_WHITESPACE)
 
     if(NOT _BASH_SUCCESS EQUAL 0)
       message(FATAL_ERROR "Failed to determine CUDA version")
@@ -180,7 +203,31 @@ if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
   endif()
 endif()
 
-message(STATUS "GPU architectures: ${CMAKE_CUDA_ARCHITECTURES}")
+if(CMAKE_CUDA_ARCHITECTURES STREQUAL "native")
+  # Detect highest available compute capability
+  set(OUTPUTFILE ${PROJECT_BINARY_DIR}/detect_cuda_arch)
+  set(CUDAFILE ${CMAKE_SOURCE_DIR}/cmake/utils/detect_cuda_arch.cu)
+  execute_process(COMMAND ${CMAKE_CUDA_COMPILER} -lcuda ${CUDAFILE} -o
+                          ${OUTPUTFILE})
+  message(VERBOSE "Detecting native CUDA compute capability")
+  execute_process(
+    COMMAND ${OUTPUTFILE}
+    RESULT_VARIABLE CUDA_RETURN_CODE
+    OUTPUT_VARIABLE CUDA_ARCH_OUTPUT)
+  if(NOT ${CUDA_RETURN_CODE} EQUAL 0)
+    message(WARNING "Detecting native CUDA compute capability - fail")
+    message(
+      WARNING "CUDA compute capability detection failed, compiling for 'all'")
+    set(CMAKE_CUDA_ARCHITECTURES_ORIG "all")
+  else()
+    message(STATUS "Detecting native CUDA compute capability - done")
+    set(CMAKE_CUDA_ARCHITECTURES_ORIG "${CUDA_ARCH_OUTPUT}")
+  endif()
+else()
+  # Store CMAKE_CUDA_ARCHITECTURES for later use since torch sets this to "OFF"
+  set(CMAKE_CUDA_ARCHITECTURES_ORIG "${CMAKE_CUDA_ARCHITECTURES}")
+endif()
+message(STATUS "GPU architectures: ${CMAKE_CUDA_ARCHITECTURES_ORIG}")
 
 enable_language(C CXX CUDA)
 
@@ -306,7 +353,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_CUDA_STANDARD ${CMAKE_CXX_STANDARD})
 
 if(UNIX)
-  set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -Og")
+  set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -g -O0 -fno-inline")
 endif()
 
 # Note: The following are desirable settings that should be enabled if we

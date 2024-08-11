@@ -1,6 +1,3 @@
-//
-// Created by martinma on 5/24/23.
-//
 /*
  * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
  *
@@ -24,7 +21,7 @@
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/stringUtils.h"
-#include "tensorrt_llm/runtime/gptDecoderBatch.h"
+#include "tensorrt_llm/runtime/gptDecoderBatched.h"
 #include "tensorrt_llm/runtime/ipcUtils.h"
 #include "tensorrt_llm/runtime/ncclCommunicator.h"
 #include "tensorrt_llm/runtime/runtimeBuffers.h"
@@ -74,12 +71,12 @@ auto const kProfileMbIdxs = populateMicrobatchIndexes();
 } // namespace
 
 GptSession::GptSession(Config const& sessionConfig, ModelConfig const& modelConfig, WorldConfig const& worldConfig,
-    void const* engineBuffer, std::size_t engineSize, LoggerPtr logger)
+    RawEngine const& rawEngine, LoggerPtr logger)
     : mModelConfig{modelConfig}
     , mWorldConfig{worldConfig}
     , mDevice{utils::initDevice(worldConfig)}
     , mLogger{logger ? std::move(logger) : std::make_shared<TllmLogger>()}
-    , mRuntime{std::make_shared<TllmRuntime>(engineBuffer, engineSize, sessionConfig.gpuWeightsPercent, *mLogger)}
+    , mRuntime{std::make_shared<TllmRuntime>(rawEngine, mLogger.get(), sessionConfig.gpuWeightsPercent)}
 {
     TLLM_LOG_WARNING(
         "GptSession is deprecated and will be removed in a future release."
@@ -107,6 +104,11 @@ nvinfer1::ILogger& GptSession::getLogger() const
 BufferManager const& GptSession::getBufferManager() const
 {
     return mRuntime->getBufferManager();
+}
+
+BufferManager::CudaStreamPtr GptSession::getRuntimeStreamPtr() const
+{
+    return mRuntime->getStreamPtr();
 }
 
 nvinfer1::DataType GptSession::getLogitDataType() const
@@ -167,7 +169,8 @@ void GptSession::createDecoders(SizeType32 batchSize, SizeType32 beamWidth, Size
     {
         if (decoderPerRequest)
         {
-            mDecoders.emplace_back(std::make_shared<GptDecoderBatch>(vocabSize, vocabSizePadded, stream));
+            mDecoders.emplace_back(std::make_shared<GptDecoderBatched>(
+                vocabSize, vocabSizePadded, stream, mModelConfig.getSpeculativeDecodingMode(), logitsType));
         }
         else
         {
@@ -175,7 +178,7 @@ void GptSession::createDecoders(SizeType32 batchSize, SizeType32 beamWidth, Size
         }
         constexpr SizeType32 maxTokensPerStep = 1;
         mDecoders.back()->setup(decodingMode, batchSize, beamWidth, maxAttentionWindow, sinkTokenLength,
-            maxSequenceLength, maxTokensPerStep, /* fusedDecoder*/ false, logitsType, mModelConfig);
+            maxSequenceLength, maxTokensPerStep, logitsType, mModelConfig);
     }
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
@@ -295,7 +298,7 @@ void GptSession::setup(Config const& sessionConfig)
 
     // Store this param related to decoder buffer size and kv cache manager to check against
     // the input shape with the params given in generate().
-    // gptDecoderBatch does not resize buffers, but allows smaller batchSize and beamWidth.
+    // GptDecoderBatched does not resize buffers, but allows smaller batchSize and beamWidth.
     // TODO refactor batch manager to remove dependency on maxSequenceLength.
     mDecoderMaxSequenceLength = maxSequenceLength;
     mDecoderMaxAttentionWindow = maxAttentionWindow;
@@ -320,7 +323,7 @@ void GptSession::setup(Config const& sessionConfig)
         }
     }
 
-    if (mWorldConfig.isTensorParallel() && mModelConfig.useCustomAllReduce())
+    if (mWorldConfig.isTensorParallel())
     {
         createCustomAllReduceWorkspace(mMicroBatchConfig.genBatchSize, maxBeamWidth, maxSequenceLength);
     }
@@ -402,7 +405,8 @@ ITensor::SharedPtr GptSession::initDecoder(ITensor& outputIds, GenerationInput c
 namespace
 {
 std::tuple<std::vector<ITensor::SharedPtr>, std::vector<ITensor::SharedPtr>, std::vector<SizeType32>> splitInputIds(
-    GenerationInput const& inputs, SizeType32 microBatchSize, BufferManager& manager)
+    GenerationInput const& inputs, SizeType32 microBatchSize, BufferManager& manager,
+    std::optional<SizeType32> maxNumTokens)
 {
     auto const numRequests = static_cast<SizeType32>(inputs.lengths->getShape().d[0]);
 
@@ -426,7 +430,11 @@ std::tuple<std::vector<ITensor::SharedPtr>, std::vector<ITensor::SharedPtr>, std
             auto const batchSize = std::min(microBatchSize, numRequests - offset);
             auto const numTokens = std::accumulate(
                 contextLengthsRange.begin() + offset, contextLengthsRange.begin() + offset + batchSize, 0);
-
+            if (maxNumTokens)
+                TLLM_CHECK_WITH_INFO(numTokens <= maxNumTokens.value(),
+                    "Micro-batch %d with %d token exceeds max_num_tokens=%d, consider to use larger value when "
+                    "building engine",
+                    offset / microBatchSize, numTokens, maxNumTokens.value());
             ITensor::SharedPtr batchInputs = ITensor::slice(inputIdsView, tokensBegin, numTokens);
             TLLM_CHECK(batchInputs->getShape().nbDims == 1);
             TLLM_CHECK(batchInputs->getShape().d[0] == numTokens);
@@ -453,11 +461,11 @@ std::tuple<std::vector<ITensor::SharedPtr>, std::vector<ITensor::SharedPtr>, std
     return {inputIds, inputLengths, microBatchOffsets};
 }
 
-std::vector<GenerationInput> splitInputs(
-    GenerationInput const& inputs, SizeType32 microBatchSize, BufferManager& manager)
+std::vector<GenerationInput> splitInputs(GenerationInput const& inputs, SizeType32 microBatchSize,
+    BufferManager& manager, std::optional<SizeType32> maxNumTokens)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-    auto [inputIds, inputLengths, microBatchOffsets] = splitInputIds(inputs, microBatchSize, manager);
+    auto [inputIds, inputLengths, microBatchOffsets] = splitInputIds(inputs, microBatchSize, manager, maxNumTokens);
 
     std::vector<GenerationInput> inputBatches;
     for (std::size_t batchId = 0; batchId < inputIds.size(); ++batchId)
@@ -647,7 +655,6 @@ void GptSession::generate(GenerationOutput& outputs, GenerationInput const& inpu
 
     // callbacks
     auto const onTokenGenerated = createOnTokenGeneratedCallback(outputs);
-
     if (batchSize <= mMicroBatchConfig.genBatchSize)
     {
         std::vector<GenerationInput> microBatchesInputs{inputs};
@@ -656,7 +663,8 @@ void GptSession::generate(GenerationOutput& outputs, GenerationInput const& inpu
     }
     else
     {
-        auto const microBatchesInputs = splitInputs(inputs, mMicroBatchConfig.genBatchSize, manager);
+        auto const microBatchesInputs
+            = splitInputs(inputs, mMicroBatchConfig.genBatchSize, manager, mModelConfig.getMaxNumTokens());
         auto microBatchesOutputs = splitOutputs(outputs, mMicroBatchConfig.genBatchSize, mWorldConfig);
         generateBatched(microBatchesOutputs, microBatchesInputs, samplingConfig, onTokenGenerated, generationProfiler);
     }
@@ -813,7 +821,7 @@ void GptSession::generateBatched(std::vector<GenerationOutput>& microBatchesOutp
         // TODO(micro batching) use mCommStream?
         if (beamWidth > 1)
         {
-            finalize(microBatchId);
+            finalize(microBatchId, samplingConfig);
         }
         else if (!mWorldConfig.isPipelineParallel())
         {
@@ -871,7 +879,7 @@ void GptSession::executeContextStep(std::vector<GenerationInput> const& generati
 
         auto const contextBatchSize = mMicroBatchConfig.ctxBatchSize;
         auto [inputIds, inputLengths, contextBatchOffsets]
-            = splitInputIds(generationBatchInputs, contextBatchSize, manager);
+            = splitInputIds(generationBatchInputs, contextBatchSize, manager, mModelConfig.getMaxNumTokens());
         auto contextBuffers = generationBuffers.split(contextBatchSize, mModelConfig, mWorldConfig);
         TLLM_CHECK(inputIds.size() == contextBuffers.size());
         auto const numContextBatches = static_cast<SizeType32>(contextBuffers.size());
@@ -1135,7 +1143,7 @@ bool GptSession::shouldStopSync(SizeType32 batchSize, SizeType32 beamWidth, Size
     return nbFinished == batchSize * beamWidth;
 }
 
-void GptSession::finalize(SizeType32 microBatchId)
+void GptSession::finalize(SizeType32 microBatchId, SamplingConfig const& samplingConfig)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     auto& manager = mRuntime->getBufferManager();
@@ -1153,7 +1161,7 @@ void GptSession::finalize(SizeType32 microBatchId)
         if (mWorldConfig.isLastPipelineParallelRank())
         {                                               // send ids from last to first
             auto& decoder = mDecoders.at(microBatchId); // only the last rank has the decoder
-            decoder->finalize();
+            decoder->finalize(samplingConfig);
             auto finalOutputIds = decoder->getOutputIds();
 
             auto const peer = pipelineGroup.front();
@@ -1192,7 +1200,7 @@ void GptSession::finalize(SizeType32 microBatchId)
     else
     {
         auto& decoder = mDecoders.at(microBatchId); // all ranks have the decoder
-        decoder->finalize();
+        decoder->finalize(samplingConfig);
         auto finalOutputIds = decoder->getOutputIds();
         manager.copy(*finalOutputIds, *outputIds);
         if (cumLogProbs)

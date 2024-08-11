@@ -51,7 +51,7 @@ void SmoothQuantGemmPluginProfiler::runTactic(int m, int n, int k, SmoothQuantGe
         aTmp, bTmp, mQuantMode, alphaColTmp, alphaRowTmp, cTmp, m, n, k, tactic, workspaceTmp, wsSize, stream);
 }
 
-void SmoothQuantGemmPluginProfiler::computeTmpSize(int maxM, int n, int k)
+void SmoothQuantGemmPluginProfiler::computeTmpSize(size_t maxM, size_t n, size_t k)
 {
     std::vector<size_t> workspaces = {
         maxM * k * sizeof(int8_t),                                  // A
@@ -119,11 +119,12 @@ void SmoothQuantGemmPlugin::init(nvinfer1::DataType type)
     {
         m_sqGemmRunner = std::make_shared<CutlassInt8GemmRunner<int32_t>>();
     }
-    else
+#ifdef ENABLE_BF16
+    else if (mType == nvinfer1::DataType::kBF16)
     {
-        // TODO: add bf16 support
-        TLLM_THROW("Support for bf16 is missing");
+        m_sqGemmRunner = std::make_shared<CutlassInt8GemmRunner<__nv_bfloat16>>();
     }
+#endif
 
     mPluginProfiler->setQuantMode(mQuantMode);
 
@@ -251,6 +252,12 @@ int SmoothQuantGemmPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
         {
             tensorrt_llm::kernels::smooth_quant::int8_sq_launcher<float>(params, stream);
         }
+#ifdef ENABLE_BF16
+        else if (mType == nvinfer1::DataType::kBF16)
+        {
+            tensorrt_llm::kernels::smooth_quant::int8_sq_launcher<__nv_bfloat16>(params, stream);
+        }
+#endif
         else if (mType == nvinfer1::DataType::kINT32)
         {
             tensorrt_llm::kernels::smooth_quant::int8_sq_launcher<int>(params, stream);

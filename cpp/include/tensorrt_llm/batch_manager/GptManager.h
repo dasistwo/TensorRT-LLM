@@ -48,9 +48,9 @@ public:
     using RequestList = std::list<std::shared_ptr<LlmRequest>>;
     using TensorPtr = runtime::ITensor::SharedPtr;
 
-    GptManager(std::filesystem::path const& trtEnginePath, TrtGptModelType modelType, SizeType32 maxBeamWidth,
-        executor::SchedulerConfig const& schedulerConfig, GetInferenceRequestsCallback getInferenceRequestsCb,
-        SendResponseCallback sendResponseCb, PollStopSignalCallback pollStopSignalCb = nullptr,
+    GptManager(std::filesystem::path const& trtEnginePath, TrtGptModelType modelType,
+        GetInferenceRequestsCallback getInferenceRequestsCb, SendResponseCallback sendResponseCb,
+        PollStopSignalCallback pollStopSignalCb = nullptr,
         ReturnBatchManagerStatsCallback returnBatchManagerStatsCb = nullptr,
         TrtGptModelOptionalParams const& optionalParams = TrtGptModelOptionalParams(),
         std::optional<uint64_t> terminateReqId = std::nullopt, bool excludeInputInOutput = false);
@@ -122,6 +122,9 @@ private:
     void decoupled_execution_loop();
     std::shared_ptr<std::thread> worker_thread_;
     std::shared_ptr<nvinfer1::ILogger> mLogger{};
+
+    inline static std::string const kPROFILE_START_STOP_ENV_VAR_NAME = "TLLM_PROFILE_START_STOP";
+    inline static std::string const kLEGACY_PROFILE_START_STOP_ENV_VAR_NAME = "TLLM_GPTM_PROFILE_START_STOP";
 };
 
 } // namespace tensorrt_llm::batch_manager

@@ -15,6 +15,7 @@
  */
 #pragma once
 
+#include "tensorrt_llm/kernels/contextFusedMultiHeadAttention/fused_multihead_attention_common.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 #include <cstdint>
 #include <cuda_fp16.h>
@@ -32,11 +33,17 @@ enum class AttentionMaskType
     PADDING = 0,
     // Mask the padded tokens and all the tokens that come after in a sequence.
     CAUSAL = 1,
+    // Only attend to the previous tokens in a fixed-length window.
+    SLIDING_WINDOW_CAUSAL = 2,
     // See ChatGLM-6B mask.
-    BIDIRECTIONAL = 2,
+    BIDIRECTIONAL = 3,
     // See GLM-10B mask.
     // TODO: merge this mask into BIDIRECTIONAL
-    BIDIRECTIONALGLM = 3
+    BIDIRECTIONALGLM = 4,
+    // For Phi-3-small model
+    BLOCKSPARSE = 5,
+    // The custom mask input.
+    CUSTOM_MASK = 6,
 };
 
 enum class PositionEmbeddingType : int8_t
@@ -57,6 +64,33 @@ enum class RotaryScalingType : int8_t
     kNONE = 0,
     kLINEAR = 1,
     kDYNAMIC = 2,
+    kLONG = 3,
+    kLLAMA3 = 4
+};
+
+struct BlockSparseParams
+{
+    int block_size;
+    int homo_head_pattern;
+    int num_local_blocks; // Sliding window blocks
+    int vertical_stride;
+
+    __device__ bool computeMask(int row_idx, int col_idx, int seq_length, int num_heads, int head_idx) const
+    {
+        bool causal_mask = row_idx < seq_length && col_idx < seq_length && col_idx <= row_idx;
+
+        // Mask 1/0 decision is made at block_size granularity
+        int block_row_idx = row_idx / block_size;
+        int block_col_idx = col_idx / block_size;
+
+        bool block_local_mask = (block_row_idx - block_col_idx) < num_local_blocks;
+
+        int head_sliding_step = homo_head_pattern ? 0 : std::max(1, int(vertical_stride / num_heads));
+        bool block_vertical_stride_mask = ((block_col_idx + head_idx * head_sliding_step + 1) % vertical_stride) == 0;
+
+        bool is_valid = causal_mask && (block_local_mask || block_vertical_stride_mask);
+        return is_valid;
+    }
 };
 
 template <typename AttentionMaskDataType>
@@ -68,6 +102,8 @@ struct BuildDecoderInfoParams
     int* seqKVOffsets;
     // The number of padded tokens in the corresponding padded tensor before the current token. Shape: [numTokens].
     int* paddingOffsets;
+    // The offsets to the 1st row in each sequence of packed mask buffer. Shape: [batchSize+1].
+    int* packedMaskRowOffsets;
 
     // The mask to mark invalid tokens in Attention - that's not used by the plugins as it can be
     // computed on-the-fly. When it's not needed, simply use nullptr.
@@ -97,6 +133,8 @@ struct BuildDecoderInfoParams
     int numTokens;
     // The type of attention.
     AttentionMaskType attentionMaskType;
+    // Params for block sparse pattern
+    BlockSparseParams blockSparseParams;
 
     // Rotary Embedding inv_freq.
     // [batch_size, halfRotaryDim] variable across different requests due to dynamic scaling.
@@ -105,6 +143,7 @@ struct BuildDecoderInfoParams
     int rotaryEmbeddingDim;
     RotaryScalingType rotaryScalingType;
     float* rotaryEmbeddingInvFreq;
+    float const* rotaryEmbeddingInvFreqCache;
     float2* rotaryEmbeddingCoeffCache;
     // Dynamic scaling;
     int rotaryEmbeddingMaxPositions;
@@ -141,6 +180,7 @@ struct BuildDecoderInfoParams
         ss << "rotaryEmbeddingDim: " << rotaryEmbeddingDim << std::endl;
         ss << "rotaryScalingType: " << static_cast<int>(rotaryScalingType) << std::endl;
         ss << "rotaryEmbeddingInvFreq: " << rotaryEmbeddingInvFreq << std::endl;
+        ss << "rotaryEmbeddingInvFreqCache: " << rotaryEmbeddingInvFreqCache << std::endl;
         ss << "rotaryEmbeddingCoeffCache: " << rotaryEmbeddingCoeffCache << std::endl;
         ss << "rotaryEmbeddingMaxPositions: " << rotaryEmbeddingMaxPositions << std::endl;
 

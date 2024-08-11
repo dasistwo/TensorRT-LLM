@@ -19,6 +19,7 @@ set(SRCS
     utils/sessionUtils.cpp
     utils/debugUtils.cu
     bufferManager.cpp
+    explicitDraftTokensBuffers.cpp
     layerProfiler.cpp
     loraManager.cpp
     loraUtils.cpp
@@ -27,7 +28,7 @@ set(SRCS
     decodingOutput.cpp
     generationConfig.cpp
     gptDecoder.cpp
-    gptDecoderBatch.cpp
+    gptDecoderBatched.cpp
     gptJsonConfig.cpp
     gptSession.cpp
     iBuffer.cpp

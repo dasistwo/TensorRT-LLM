@@ -62,8 +62,10 @@ StatefulGptDecoder::StatefulGptDecoder(std::size_t vocabSize, std::size_t vocabS
 
     dInput->stopWordsPtrs = mBufferManager.emptyTensor(MemoryType::kPINNED, TRTDataType<int32_t*>::value);
     dInput->stopWordsLens = mBufferManager.emptyTensor(MemoryType::kPINNED, TRTDataType<SizeType32>::value);
+    dInput->stopWordsLists.resize(1);
     dInput->badWordsPtrs = mBufferManager.emptyTensor(MemoryType::kPINNED, TRTDataType<int32_t*>::value);
     dInput->badWordsLens = mBufferManager.emptyTensor(MemoryType::kPINNED, TRTDataType<SizeType32>::value);
+    dInput->badWordsLists.resize(1);
 
     mFinishedSum = BufferManager::pinned(ITensor::makeShape({1}), nvSizeType);
 
@@ -72,7 +74,7 @@ StatefulGptDecoder::StatefulGptDecoder(std::size_t vocabSize, std::size_t vocabS
 
 void StatefulGptDecoder::setup(executor::DecodingMode const& mode, SizeType32 maxBatchSize, SizeType32 maxBeamWidth,
     SizeType32 maxAttentionWindow, SizeType32 sinkTokenLength, SizeType32 maxSequenceLength,
-    SizeType32 maxTokensPerStep, bool fusedDecoder, nvinfer1::DataType dtype, ModelConfig const& modelConfig)
+    SizeType32 maxTokensPerStep, nvinfer1::DataType dtype, ModelConfig const& modelConfig)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     TLLM_CHECK(maxTokensPerStep == 1);
@@ -132,10 +134,6 @@ void StatefulGptDecoder::reshapeBuffers(SizeType32 batchSize, SizeType32 beamWid
         mBufferManager.setZero(*dOutput.cumLogProbs);
         dOutput.beamHypotheses.reshape(batchSize, beamWidth, mMaxSequenceLength);
     }
-    else
-    {
-        dOutput.beamHypotheses.release();
-    }
 
     mNbSteps = 0;
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
@@ -185,7 +183,7 @@ void StatefulGptDecoder::newBatch(
     dInput.maxLength = maxInputLength;
     dInput.maxAttentionWindow = mMaxAttentionWindow;
     dInput.sinkTokenLength = mSinkTokenLength;
-    dInput.maxBatchSize = batchSize;
+    dInput.batchSize = batchSize;
     kernels::invokeFill(const_cast<ITensor&>(*dInput.endIds), endId, *stream);
     dInput.embeddingBias = inputs.embeddingBias;
 
@@ -216,7 +214,7 @@ void StatefulGptDecoder::newBatch(
         }
         // NOTE(nkorobov): dInput->badWordsList is not used in gptDecoder, but required to keep badWordsList memory
         // allocated
-        dInput.badWordsList = badWordsList;
+        dInput.badWordsLists.at(0) = badWordsList;
     }
     if (inputs.stopWordsList)
     {
@@ -233,7 +231,7 @@ void StatefulGptDecoder::newBatch(
         }
         // NOTE(nkorobov): dInput->stopWordsList is not used in gptDecoder, but required to keep stopWordsList memory
         // allocated
-        dInput.stopWordsList = stopWordsList;
+        dInput.stopWordsLists.at(0) = stopWordsList;
     }
 
     auto inputLengthsView = ITensor::view(dInput.lengths, ITensor::makeShape({batchSize * beamWidth}));
@@ -344,7 +342,7 @@ void StatefulGptDecoder::forwardSync()
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
-void StatefulGptDecoder::finalize() const
+void StatefulGptDecoder::finalize(SamplingConfig const&) const
 {
     // TODO (rkobus) can we do this inplace?
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);

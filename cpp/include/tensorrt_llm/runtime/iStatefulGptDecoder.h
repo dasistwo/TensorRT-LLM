@@ -21,6 +21,7 @@
 #include "tensorrt_llm/runtime/generationInput.h"
 #include "tensorrt_llm/runtime/generationOutput.h"
 #include "tensorrt_llm/runtime/iTensor.h"
+#include "tensorrt_llm/runtime/modelConfig.h"
 #include "tensorrt_llm/runtime/samplingConfig.h"
 
 #include <memory>
@@ -37,7 +38,7 @@ namespace decoder
 class Input
 {
 public:
-    using TensorPtr = std::shared_ptr<ITensor const>;
+    using TensorPtr = ITensor::SharedPtr;
 
     explicit Input(TensorPtr logits)
         : logits{std::move(logits)}
@@ -75,7 +76,7 @@ public:
     //! Setup the decoder before calling `forward()`, also calls reshapeBuffers
     virtual void setup(executor::DecodingMode const& mode, SizeType32 maxBatchSize, SizeType32 maxBeamWidth,
         SizeType32 maxAttentionWindow, SizeType32 sinkTokenLength, SizeType32 maxSequenceLength,
-        SizeType32 maxTokensPerStep, bool fusedDecoder, nvinfer1::DataType dtype, ModelConfig const& modelConfig)
+        SizeType32 maxTokensPerStep, nvinfer1::DataType dtype, ModelConfig const& modelConfig)
         = 0;
 
     //! @brief Initialize the decoder with new batch of inputs.
@@ -97,7 +98,7 @@ public:
     }
 
     //! @brief Gather final beam search results for all requests.
-    virtual void finalize() const = 0;
+    virtual void finalize(SamplingConfig const& samplingConfig) const = 0;
 
     //! @returns [batchSize, beamWidth, maxSequenceLength], all token ids, on gpu
     [[nodiscard]] virtual TensorPtr getOutputIds() const = 0;

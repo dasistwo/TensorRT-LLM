@@ -42,15 +42,18 @@ public:
         tensorrt_llm::kernels::PositionEmbeddingType position_embedding_type,
         int rotary_embedding_dim, // for RoPE. Use 0 for non-RoPE
         float rotary_embedding_base, tensorrt_llm::kernels::RotaryScalingType rotary_embedding_scale_type,
-        float rotary_embedding_scale, float rotary_embedding_m_scale, int rotary_embedding_max_positions, int tp_size,
+        float rotary_embedding_scale, float rotary_embedding_short_m_scale, float rotary_embedding_long_m_scale,
+        int rotary_embedding_max_positions, int rotary_embedding_original_max_positions, int tp_size,
         int tp_rank,          // for ALiBi
         bool unfuse_qkv_gemm, // for AutoPP
-        tensorrt_llm::kernels::ContextFMHAType context_fmha_type, bool multi_block_mode, bool enable_xqa,
-        int kv_cache_quant_mode, bool remove_input_padding, tensorrt_llm::kernels::AttentionMaskType mask_type,
-        bool paged_kv_cache, int tokens_per_block, nvinfer1::DataType type, int32_t max_context_length,
-        bool qkv_bias_enabled, bool cross_attention = false, int max_distance = 0, bool pos_shift_enabled = false,
-        bool dense_context_fmha = false, bool use_paged_context_fmha = false, bool use_fp8_context_fmha = false,
-        bool use_cache = true, bool is_spec_decoding_enabled = false);
+        tensorrt_llm::kernels::ContextFMHAType context_fmha_type, bool enable_xqa, int kv_cache_quant_mode,
+        bool remove_input_padding, tensorrt_llm::kernels::AttentionMaskType mask_type,
+        tensorrt_llm::kernels::BlockSparseParams block_sparse_params, bool paged_kv_cache, int tokens_per_block,
+        nvinfer1::DataType type, int32_t max_context_length, bool qkv_bias_enabled, bool cross_attention = false,
+        int max_distance = 0, bool pos_shift_enabled = false, bool dense_context_fmha = false,
+        bool use_paged_context_fmha = false, bool use_fp8_context_fmha = false, bool use_cache = true,
+        bool is_spec_decoding_enabled = false, bool spec_decoding_is_generation_length_variable = false,
+        int32_t spec_decoding_max_generation_length = 1);
 
     GPTAttentionPluginCommon(void const* data, size_t length);
 
@@ -82,16 +85,20 @@ public:
 protected:
     int getMaxNumSeqLenTile(int batch_beam_size = 1) const;
     size_t getWorkspaceSizeForContext(nvinfer1::DataType type, int32_t nbReq, int32_t max_input_length,
-        int32_t max_kv_cache_len, int32_t cross_qkv_length = 0, int32_t max_num_tokens = 0) const noexcept;
+        int32_t cross_qkv_length = 0, int32_t max_num_tokens = 0) const noexcept;
     // total_num_seq is the sum of beam_width for multiple requests
-    size_t getWorkspaceSizeForGeneration(
-        nvinfer1::DataType type, int32_t total_num_seq, int32_t max_kv_cache_length) const noexcept;
+    size_t getWorkspaceSizeForGeneration(nvinfer1::DataType type, int32_t total_num_seq, int32_t max_kv_cache_length,
+        int32_t max_num_tokens) const noexcept;
 
     template <typename T, typename KVCacheBuffer>
     struct EnqueueContextParams
     {
         T const* attention_input;
         T const* qkv_bias;
+        // Context FMHA custom mask buffer.
+        uint32_t const* fmha_custom_mask;
+        // Rotary inv_freq cache buffer to avoid re-computing.
+        float const* rotary_inv_freq;
         // Rotary cos sin cache buffer to avoid re-computing.
         float2 const* rotary_cos_sin;
         int32_t input_seq_length; // padded input length
@@ -109,7 +116,7 @@ protected:
         float const* kv_scale_quant_orig;
         float const* attention_output_orig_quant;
         T const* alibi_slopes;
-        T* context_buf;
+        void* context_buf;
         void* key_value_cache;
         kernels::KVBlockArray::DataType* block_offsets;
         kernels::KVBlockArray::DataType* host_block_offsets;
@@ -127,6 +134,7 @@ protected:
         int32_t cross_qkv_length = 0;
         int32_t const* encoder_input_lengths = nullptr;
         int32_t num_encoder_tokens = 0;
+        int64_t const* runtime_perf_knobs = nullptr;
 
         std::string enqueueContextParamsToString() const
         {
@@ -136,6 +144,8 @@ protected:
 
             ss << "attention_input: " << attention_input << std::endl;
             ss << "qkv_bias: " << qkv_bias << std::endl;
+            ss << "fmha_custom_mask: " << fmha_custom_mask << std::endl;
+            ss << "rotary_inv_freq: " << rotary_inv_freq << std::endl;
             ss << "rotary_cos_sin: " << rotary_cos_sin << std::endl;
             ss << "input_seq_length: " << input_seq_length << std::endl;
             ss << "max_past_kv_len: " << max_past_kv_len << std::endl;
@@ -182,6 +192,8 @@ protected:
     {
         T const* attention_input;
         T const* qkv_bias;
+        // Rotary inv_freq cache buffer to avoid re-computing.
+        float const* rotary_inv_freq;
         // NOTE: input_seq_length might be larger than one in the medusa mode.
         int32_t input_seq_length;
         int32_t const* sequence_lengths;
@@ -191,9 +203,8 @@ protected:
         float const* kv_scale_orig_quant;
         float const* kv_scale_quant_orig;
         float const* attention_output_orig_quant;
-        float const* rotary_embedding_scaling_factors;
         T const* alibi_slopes;
-        T* context_buf;
+        void* context_buf;
         void* key_value_cache;
         kernels::KVBlockArray::DataType* block_offsets;
         void* host_primary_pool_pointer;
@@ -222,6 +233,10 @@ protected:
         int32_t const* spec_decoding_packed_mask = nullptr;
         int32_t const* spec_decoding_position_offsets = nullptr;
         int32_t const* spec_decoding_generation_lengths = nullptr;
+        bool spec_decoding_is_generation_length_variable = false;
+        int32_t spec_decoding_max_generation_length = 1;
+        int32_t total_num_input_tokens;
+        int64_t const* runtime_perf_knobs = nullptr;
     };
 
     template <typename T, typename KVCacheBuffer>
@@ -273,6 +288,11 @@ protected:
         return mUseKVCache;
     }
 
+    bool useCustomMask() const
+    {
+        return mMaskType == tensorrt_llm::kernels::AttentionMaskType::CUSTOM_MASK;
+    }
+
     void reserveSemaphoreArray(int32_t size);
 
     void debugCheckSemaphores(cudaStream_t stream);
@@ -295,11 +315,15 @@ protected:
     float mRotaryEmbeddingBase;
     tensorrt_llm::kernels::RotaryScalingType mRotaryEmbeddingScaleType;
     float mRotaryEmbeddingScale;
-    float mRotaryEmbeddingMscale;
+    float mRotaryEmbeddingShortMscale;
+    float mRotaryEmbeddingLongMscale;
     int mRotaryEmbeddingMaxPositions;
+    int mRotaryEmbeddingOriginalMaxPositions;
     tensorrt_llm::kernels::PositionEmbeddingType mPositionEmbeddingType;
     bool mRemovePadding = false;
     tensorrt_llm::kernels::AttentionMaskType mMaskType;
+    tensorrt_llm::kernels::BlockSparseParams mBlockSparseParams;
+
     // NOTE: default values for paged kv cache.
     bool mPagedKVCache = false;
     int mTokensPerBlock = 0;
@@ -317,6 +341,8 @@ protected:
     bool mFP8ContextFMHA = false;
     bool mDenseContextFMHA = false;
     bool mIsSpecDecodingEnabled = false;
+    bool mSpecDecodingIsGenerationLengthVariable = false;
+    int32_t mSpecDecodingMaxGenerationLength = 1;
 
     // Speculative decoding packed mask.
     uint4* mSpecDecodingPackedMask;
@@ -331,8 +357,7 @@ protected:
     int mMaxSharedMemoryPerBlockOptin = tensorrt_llm::common::getMaxSharedMemoryPerBlockOptin();
     // The default copy constructor will leave it as nullptr. clone() shall initialize it.
     std::shared_ptr<CUDADriverWrapper> mDriver;
-    UniqPtrWNullCopy<tensorrt_llm::kernels::MHARunner> mFMHARunner;
-    tensorrt_llm::kernels::DecoderXQARunner::Resource mDecoderXQARunnerResource;
+    UniqPtrWNullCopy<tensorrt_llm::kernels::FusedMHARunnerV2> mFMHARunner;
     UniqPtrWNullCopy<tensorrt_llm::kernels::DecoderXQARunner> mDecoderXQARunner;
 
     bool mMultiBlockMode;
