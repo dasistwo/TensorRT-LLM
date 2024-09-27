@@ -18,6 +18,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
@@ -49,6 +50,7 @@ using TokenIdType = std::int32_t;
 using VecTokens = std::vector<TokenIdType>;
 using BeamTokens = std::vector<VecTokens>;
 using IdType = std::uint64_t;
+using VecTokenExtraIds = std::vector<IdType>;
 using IterationType = std::uint64_t;
 using RandomSeedType = std::uint64_t;
 using VecLogProbs = std::vector<FloatType>;
@@ -61,6 +63,7 @@ using LogitsPostProcessorBatched = std::function<void(std::vector<IdType> const&
     std::vector<std::optional<IdType>> const&)>;
 using MedusaChoices = std::vector<std::vector<SizeType32>>;
 using PriorityType = float;
+using BufferView = std::basic_string_view<uint8_t>;
 
 enum class DataType
 {
@@ -74,6 +77,13 @@ enum class DataType
     kFP16,
     kFP32,
     kUNKNOWN
+};
+
+enum class RequestType
+{
+    REQUEST_TYPE_CONTEXT_AND_GENERATION = 0,
+    REQUEST_TYPE_CONTEXT_ONLY = 1,
+    REQUEST_TYPE_GENERATION_ONLY = 2
 };
 
 //! \brief For converting a C++ data type to a `TrtLmmDataType`.
@@ -151,6 +161,7 @@ enum class MemoryType
 {
     kCPU,
     kCPU_PINNED,
+    kCPU_PINNEDPOOL,
     kGPU,
     kUVM,
     kUNKNOWN
@@ -280,10 +291,14 @@ struct IterationStats
     IterationType iter;
     /// @brief Iteration latency (ms)
     double iterLatencyMS;
+    /// @brief The total time spent in queue by the requests that became active in this iteration (ms)
+    double newActiveRequestsQueueLatencyMS;
     /// @brief Number of active requests
     SizeType32 numActiveRequests;
     /// @brief Number of queued requests
     SizeType32 numQueuedRequests;
+    /// @brief  Number of requests that were completed in this iteration
+    SizeType32 numCompletedRequests;
     /// @brief Number of max active requests
     SizeType32 maxNumActiveRequests;
     /// @brief GPU memory usage in bytes
@@ -318,6 +333,13 @@ enum class RequestStage
     kGENERATION_COMPLETE,
 };
 
+/// @brief Struct that holds the request stats in the case of disaggregated serving
+struct DisServingRequestStats
+{
+    /// @brief The total time spent on transferring KV cache from context phase to generation phase (ms)
+    double kvCacheTransferMS;
+};
+
 /// @brief Struct that holds the stats of a single request
 struct RequestStats
 {
@@ -336,6 +358,8 @@ struct RequestStats
     /// @brief Whether the request is being paused at the current iteration due to lack of resources (KV cache blocks
     /// exhaustion for example)
     bool paused;
+    /// @brief Stats specific to disaggregated serving
+    std::optional<DisServingRequestStats> disServingStats;
 };
 
 /// @brief Struct that holds the stats of all requests in an iteration
@@ -345,6 +369,31 @@ struct RequestStatsPerIteration
     IterationType iter;
     /// @brief The stats of all active requests for this iteration
     std::vector<RequestStats> requestStats;
+};
+
+/// @brief Struct that holds the debug tensors in an iteration
+struct DebugTensorsPerIteration
+{
+    /// @brief The iteration id for these tensors
+    IterationType iter;
+    /// @brief The debug tensors for this iteration
+    std::map<std::string, Tensor> debugTensors;
+};
+
+/// @brief The reason why the model stopped generating tokens for a request.
+enum class FinishReason
+{
+    /// @brief The request is not finished.
+    kNOT_FINISHED = 0,
+
+    /// @brief The request finished because the end id was generated.
+    kEND_ID = 1,
+
+    /// @brief The request finished because a stop word was generated.
+    kSTOP_WORDS = 2,
+
+    /// @brief The request finished because the maximum number of tokens was reached.
+    kLENGTH = 3,
 };
 
 /// @brief mode of the decoder

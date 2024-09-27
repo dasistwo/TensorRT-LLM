@@ -1,8 +1,7 @@
 import asyncio
 import json
 import os as _os
-import sys as _sys
-import unittest
+import sys
 from pathlib import Path
 
 import pytest
@@ -15,12 +14,18 @@ from tensorrt_llm.executor import (GenerationExecutor, GenerationRequest,
 from tensorrt_llm.hlapi import LLM, BuildConfig
 from tensorrt_llm.hlapi.tokenizer import TransformersTokenizer
 
-_sys.path.append(_os.path.join(_os.path.dirname(__file__), '..'))
-from utils.cpp_paths import *  # noqa
+sys.path.append(_os.path.join(_os.path.dirname(__file__), '..'))
+import tempfile
+
 from utils.llm_data import llm_models_root
 from utils.util import similar
 
 WORLD_SIZE = mpi_world_size()
+
+
+@pytest.fixture(scope="module")
+def engine_path():
+    return Path(tempfile.tempdir) / "llm_engine"
 
 
 @pytest.fixture(scope="module")
@@ -67,15 +72,14 @@ def test_generation_bs2(llama_7b_bs2_path: Path):
     tokenizer = TransformersTokenizer.from_pretrained(llama_7b_bs2_path)
     prompt = "A B C D"
     prompt_token_ids = tokenizer.encode(prompt)
-    max_new_tokens = 8
+    max_tokens = 8
 
     with GenerationExecutor.create(
             llama_7b_bs2_path,
             executor_config=tllm.ExecutorConfig(max_beam_width=2)) as executor:
         result = executor.generate(prompt_token_ids,
                                    sampling_params=SamplingParams(
-                                       max_new_tokens=max_new_tokens,
-                                       beam_width=2))
+                                       max_tokens=max_tokens, beam_width=2))
         assert similar(tokenizer.decode(result.outputs[0].token_ids),
                        'E F G H I J K L')
         assert similar(tokenizer.decode(result.outputs[1].token_ids),
@@ -90,8 +94,8 @@ def test_sync_generation(llama_7b_path: Path):
 
     expected_output = "E F G H"
     expected_long_output = "E F G H I J K L"
-    sampling_params0 = SamplingParams(max_new_tokens=4)
-    sampling_params1 = SamplingParams(max_new_tokens=8)
+    sampling_params0 = SamplingParams(max_tokens=4)
+    sampling_params1 = SamplingParams(max_tokens=8)
     with GenerationExecutor.create(llama_7b_path) as executor:
         # Simple generations (synchronous)
         result = executor.generate(prompt_token_ids,
@@ -103,6 +107,7 @@ def test_sync_generation(llama_7b_path: Path):
             sampling_params=[sampling_params0, sampling_params1])
         for result, expected in zip(results,
                                     (expected_output, expected_long_output)):
+            print(f"result: {result}")
             assert tokenizer.decode(result.outputs[0].token_ids) == expected
 
         # Iterate the partial results when streaming
@@ -111,6 +116,7 @@ def test_sync_generation(llama_7b_path: Path):
                                          streaming=True)
         for partial_result in future:
             partial_text = tokenizer.decode(partial_result.outputs[0].token_ids)
+            print(f"partial_text: {partial_text}")
             assert expected_output.startswith(partial_text)
 
         # Iterate the partial results when streaming
@@ -122,6 +128,7 @@ def test_sync_generation(llama_7b_path: Path):
             for partial_result in future:
                 partial_text = tokenizer.decode(
                     partial_result.outputs[0].token_ids)
+                print(f"partial_text: {partial_text}")
                 assert expected_long_output.startswith(partial_text)
 
         # Low-level api with .submit
@@ -145,7 +152,7 @@ def test_sync_generation_tp_main_node_only(llama_7b_tp2_path: Path):
     tokenizer = TransformersTokenizer.from_pretrained(llama_7b_tp2_path)
     prompt = "deep learning"
     prompt_token_ids = tokenizer.encode(prompt)
-    sampling_params = SamplingParams(max_new_tokens=4)
+    sampling_params = SamplingParams(max_tokens=4)
 
     with GenerationExecutor.create(llama_7b_tp2_path) as executor:
 
@@ -166,7 +173,7 @@ def test_sync_generation_tp_inner(llama_7b_tp2_path: Path):
     prompt = "deep learning"
     prompt_token_ids = tokenizer.encode(prompt)
     tp_size = 2
-    sampling_params = SamplingParams(max_new_tokens=4)
+    sampling_params = SamplingParams(max_tokens=4)
 
     executor = GenerationExecutor.create(llama_7b_tp2_path,
                                          model_world_size=tp_size)
@@ -193,7 +200,3 @@ def test_sync_generation_tp_inner(llama_7b_tp2_path: Path):
     stats = executor.get_stats()
     assert json.loads(stats)["iter"] == 1
     executor.shutdown()
-
-
-if __name__ == "__main__":
-    unittest.main()

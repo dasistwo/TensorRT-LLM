@@ -16,15 +16,11 @@
 Adapted from examples/quantization/hf_ptq.py
 """
 
-import contextlib
 import copy
 import json
 import os
 import random
-import shutil
 import sys
-import tarfile
-import tempfile
 import time
 
 import numpy as np
@@ -127,11 +123,12 @@ MODEL_NAME_PATTERN_MAP = {
     "Phi3SmallForCausalLM": "phi3small",
     "Phi3ForCausalLM": "phi3",
     "Starcoder2ForCausalLM": "gptnext",
+    "GLM": "glm",
 }
 
 
 def get_tokenizer(ckpt_path, max_seq_length=2048, model_type=None):
-    print(f"Initializing tokenizer from {ckpt_path}")
+    logger.info(f"Initializing tokenizer from {ckpt_path}")
     tokenizer = AutoTokenizer.from_pretrained(
         ckpt_path,
         model_max_length=max_seq_length,
@@ -164,7 +161,7 @@ def _get_vila_model(model_dir):
 
 
 def get_model(ckpt_path, dtype="fp16", device="cuda"):
-    print(f"Initializing model from {ckpt_path}")
+    logger.info(f"Initializing model from {ckpt_path}")
     if dtype == "bf16" or dtype == "bfloat16":
         dtype = torch.bfloat16
     elif dtype == "fp16" or dtype == "float16":
@@ -182,6 +179,12 @@ def get_model(ckpt_path, dtype="fp16", device="cuda"):
         model_cls = LlavaForConditionalGeneration
     if "vila" in ckpt_path:
         model = _get_vila_model(ckpt_path)
+    elif hf_config.model_type == "glm":
+        from transformers import AutoModelForSeq2SeqLM
+        model = AutoModelForSeq2SeqLM.from_pretrained(ckpt_path,
+                                                      device_map="cuda",
+                                                      torch_dtype=dtype,
+                                                      trust_remote_code=True)
     else:
         model = model_cls.from_pretrained(
             ckpt_path,
@@ -194,7 +197,7 @@ def get_model(ckpt_path, dtype="fp16", device="cuda"):
 
     model_dtype = next(model.parameters()).dtype
     if dtype != model_dtype:
-        print(
+        logger.info(
             f"[TensorRT-LLM][WARNING] The manually set model data type is {dtype}, "
             f"but the data type of the HuggingFace model is {model_dtype}.")
 
@@ -213,7 +216,7 @@ def get_calib_dataloader(dataset_name_or_dir="cnn_dailymail",
                          batch_size=1,
                          calib_size=512,
                          block_size=512):
-    print("Loading calibration dataset")
+    logger.info("Loading calibration dataset")
     if dataset_name_or_dir == "pileval":
         dataset = load_dataset(
             "json",
@@ -224,7 +227,7 @@ def get_calib_dataloader(dataset_name_or_dir="cnn_dailymail",
         dataset = load_dataset(dataset_name_or_dir, name="3.0.0", split="train")
         dataset = dataset["article"][:calib_size]
     elif os.path.isdir(dataset_name_or_dir):
-        print(
+        logger.info(
             f"Recognized local dataset repo {dataset_name_or_dir} for calibration; "
             "assuming the calibration data are in the train split and text column."
         )
@@ -257,17 +260,18 @@ def quantize_model(model, quant_cfg, calib_dataloader=None):
             return
         """Adjusts weights and scaling factors based on selected algorithms."""
         for idx, data in enumerate(calib_dataloader):
-            print(f"Calibrating batch {idx}")
+            logger.debug(f"Calibrating batch {idx}")
             # model might be mapped to different device because the device_map is auto
             data = data.to(model.device)
             model(data)
 
-    print("Starting quantization...")
+    logger.info("Starting quantization...")
     start_time = time.time()
     atq.quantize(model, quant_cfg, forward_loop=calibrate_loop)
     end_time = time.time()
-    print("Quantization done. Total time used: {:.2f} s.".format(end_time -
-                                                                 start_time))
+    logger.info(
+        "Quantization done. Total time used: {:.2f} s.".format(end_time -
+                                                               start_time))
 
     return model
 
@@ -336,7 +340,7 @@ def combine_medusa_weight(tp_size, pp_size, base_model_output_dir,
         json.dump(base_model_config, f, indent=4)
 
     torch.cuda.empty_cache()
-    print("Combine medusa heads' weight, done.")
+    logger.info("Combine medusa heads' weight, done.")
 
 
 def quantize_and_export(*,
@@ -394,15 +398,15 @@ def quantize_and_export(*,
 
     if qformat in ["full_prec", "int8_wo", "int4_wo"
                    ] and kv_cache_dtype is None:
-        print(f"No quantization applied, export {dtype} model")
+        logger.info(f"No quantization applied, export {dtype} model")
     else:
         if "awq" in qformat:
             if calib_size > 32:
-                print(
+                logger.info(
                     f"AWQ calibration could take longer with calib_size = {calib_size}, Using"
                     " calib_size=32 instead")
                 calib_size = 32
-            print(
+            logger.info(
                 "\nAWQ calibration could take longer than other calibration methods. Please"
                 " increase the batch size to speed up the calibration process. Batch size can be"
                 " set by adding the argument --batch_size <batch_size> to the command line.\n"
@@ -439,7 +443,7 @@ def quantize_and_export(*,
 
     with torch.inference_mode():
         if model_type is None:
-            print(
+            logger.info(
                 f"Unknown model type {type(model).__name__}. Continue exporting..."
             )
             model_type = f"unknown:{type(model).__name__}"
@@ -549,86 +553,13 @@ def quantize_and_export(*,
                                   max_draft_len, medusa_hidden_act,
                                   medusa_model_dir, quant_medusa_head)
         end_time = time.time()
-        print(
+        logger.info(
             "Quantized model exported to {} \nTotal time used {:.2f} s.".format(
                 export_path, end_time - start_time))
 
 
-def load_config(model_file: str):
-    """Load model config from extracted directory or '.nemo' tarball."""
-    from modelopt.torch.utils import print_rank_0
-    from omegaconf import OmegaConf
-
-    if os.path.isfile(model_file):
-        with tempfile.TemporaryDirectory() as tmp, tarfile.open(
-                model_file, "r:") as tar:
-            try:
-                tar.extract("./model_config.yaml", path=tmp)
-            except KeyError:
-                print_rank_0("File name not found, trying legacy name...")
-                tar.extract("model_config.yaml", path=tmp)
-            model_config = OmegaConf.load(os.path.join(tmp,
-                                                       "model_config.yaml"))
-    elif os.path.isdir(model_file):
-        model_config = OmegaConf.load(
-            os.path.join(model_file, "model_config.yaml"))
-    else:
-        raise FileNotFoundError(model_file)
-
-    return model_config
-
-
-def save_artifacts(model, output_dir: str, use_abspath: bool = False) -> None:
-    """Save all model artifacts and tokenizer config to a given output directory."""
-    from modelopt.torch.utils import print_rank_0
-    from nemo.utils import AppState
-    from omegaconf import OmegaConf
-
-    app_state = AppState()
-    model_file = app_state.model_restore_path
-    model_cfg = copy.deepcopy(model.cfg)
-    if not hasattr(model, "artifacts"):
-        if hasattr(model_cfg, "tokenizer"):
-            OmegaConf.save(model_cfg.tokenizer,
-                           os.path.join(output_dir, "tokenizer_config.yaml"))
-        return
-
-    # Setup model file handling context: directory or tarball
-    if os.path.isfile(model_file):
-        model_file_handler = tarfile.open
-        kwargs = {"name": model_file, "mode": "r:"}
-    elif os.path.isdir(model_file):
-        model_file_handler = contextlib.nullcontext
-        kwargs = {}
-    else:
-        raise FileNotFoundError(model_file)
-
-    # Copy or extract artifacts depending on the context
-    with model_file_handler(**kwargs) as maybe_tar:
-        for arti_name, arti_item in model.artifacts.items():
-            _, arti_file = arti_item.path.split("nemo:")
-            arti_path = os.path.join(output_dir, arti_name)
-            if maybe_tar is not None:
-                try:
-                    maybe_tar.extract(f"./{arti_file}", path=output_dir)
-                except KeyError:
-                    print_rank_0("File name not found, trying legacy name...")
-                    maybe_tar.extract(f"{arti_file}", path=output_dir)
-                os.rename(os.path.join(output_dir, arti_file), arti_path)
-            else:
-                shutil.copy(os.path.join(model_file, arti_file), arti_path)
-            # Store artifact path as basename by default. Otherwise save absolute path but bear in mind
-            # that in this case output directory should be permanent for correct artifact recovery later
-            arti_path = os.path.abspath(
-                arti_path) if use_abspath else os.path.basename(arti_path)
-            OmegaConf.update(model_cfg, arti_name, arti_path)
-
-    if hasattr(model_cfg, "tokenizer"):
-        OmegaConf.save(model_cfg.tokenizer,
-                       os.path.join(output_dir, "tokenizer_config.yaml"))
-
-
 def unwrap_model(model, module_instances=None):
+    # Reference: https://github.com/NVIDIA/Megatron-LM/blob/core_r0.8.0/megatron/training/utils.py
     from megatron.core import DistributedDataParallel as DDP
     from megatron.core.transformer.module import Float16Module
 
@@ -668,7 +599,7 @@ def get_nemo_calib_dataloader(dataset_name_or_dir="cnn_dailymail",
         dataset = load_dataset(dataset_name_or_dir, name="3.0.0", split="train")
         text_column = "article"
     elif os.path.isdir(dataset_name_or_dir):
-        print(
+        logger.info(
             f"Recognized local dataset repo {dataset_name_or_dir} for calibration; "
             "assuming the calibration data are in the train split and text column."
         )
@@ -706,8 +637,11 @@ def quantize_nemo_and_export(*, nemo_ckpt_path, decoder_type, calib_dataset,
     from modelopt.torch.utils import print_rank_0
     from nemo.collections.nlp.models.language_modeling.megatron_gpt_model import \
         MegatronGPTModel
+    from nemo.collections.nlp.modules.common.text_generation_strategy import \
+        GPTModelTextGenerationStrategy
     from nemo.collections.nlp.parts.nlp_overrides import (
         NLPDDPStrategy, NLPSaveRestoreConnector)
+    from nemo.utils.model_utils import load_config, save_artifacts
     from omegaconf.omegaconf import open_dict
     from pytorch_lightning.trainer.trainer import Trainer
 
@@ -733,7 +667,7 @@ def quantize_nemo_and_export(*, nemo_ckpt_path, decoder_type, calib_dataset,
         model_cfg.sequence_parallel = False
         # Only custom modelopt spec is supported for PTQ: this custom spec is largely based on local Megatron-LM
         # layer definitions to avoid Transformer Engine implementations that are currently not supported.
-        model_cfg.name = "ammo"
+        model_cfg.name = "modelopt"
 
     # trainer required for restoring model parallel models
     trainer_config = {
@@ -785,6 +719,7 @@ def quantize_nemo_and_export(*, nemo_ckpt_path, decoder_type, calib_dataset,
         'compute_logprob': False,
         'batch_size': batch_size,
         'max_context_length': calib_max_seq_length,
+        'strategy': GPTModelTextGenerationStrategy(model),
     }
     model.set_inference_config(inference_config)
 

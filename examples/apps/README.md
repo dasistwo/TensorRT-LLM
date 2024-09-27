@@ -1,5 +1,42 @@
 # Apps examples with GenerationExecutor / High-level API
-
+## OpenAI API
+[openai_server.py](./openai_server.py) is an OpenAI compatible server which supports `v1/version`, `v1/completions` and `v1/chat/completions`. [openai_client.py](./openai_client.py) is a simple example using OpenAI client to query your model. To start the server, you can run
+```
+python3 ./openai_server.py <model_path>
+```
+Then you can use the following APIs by running our example client or by `curl`.
+### v1/completions
+Query by `curl`:
+```
+curl http://localhost:8000/v1/completions \
+    -H "Content-Type: application/json" \
+    -d '{
+        "model": <model_name>,
+        "prompt": "Where is New York?",
+        "max_tokens": 16,
+        "temperature": 0
+    }'
+```
+Query by our example:
+```
+python3 ./openai_client.py --prompt "Where is New York?" --api completions
+```
+### v1/chat/completions
+Query by `curl`:
+```
+curl http://localhost:8000/v1/chat/completions \
+    -H "Content-Type: application/json" \
+    -d '{
+        "model": <model_name>,
+        "prompt": "Where is New York?",
+        "max_tokens": 16,
+        "temperature": 0
+    }'
+```
+Query by our example:
+```
+python3 ./openai_client.py --prompt "Where is New York?" --api chat
+```
 ## Python chat
 
 [chat.py](./chat.py) provides a small examples to play around with your model. Before running, install additional requirements with ` pip install -r ./requirements.txt`. Then you can run it with
@@ -42,12 +79,12 @@ To get more information on all the arguments, please run `python3 ./fastapi_serv
 
 ### Send requests
 
-You can pass request arguments like "max_new_tokens", "top_p", "top_k" in your JSON dict:
+You can pass request arguments like "max_tokens", "top_p", "top_k" in your JSON dict:
 ```
-curl http://localhost:8000/generate -d '{"prompt": "In this example,", "max_new_tokens": 8}'
+curl http://localhost:8000/generate -d '{"prompt": "In this example,", "max_tokens": 8}'
 ```
 
 You can also use the streaming interface with:
 ```
-curl http://localhost:8000/generate -d '{"prompt": "In this example,", "max_new_tokens": 8, "streaming": true}'
+curl http://localhost:8000/generate -d '{"prompt": "In this example,", "max_tokens": 8, "streaming": true}'
 ```

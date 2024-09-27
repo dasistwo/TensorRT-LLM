@@ -20,11 +20,10 @@ from .attention import (Attention, AttentionMaskType, AttentionParams,
 from .cast import Cast
 from .conv import Conv1d, Conv2d, ConvTranspose2d
 from .embedding import Embedding, PromptTuningEmbedding
-from .linear import (ColumnLinear, Linear, ParallelLMHead, QKVColumnLinear,
-                     RowLinear)
+from .linear import ColumnLinear, Linear, RowLinear
 from .lora import Lora, LoraParams, LoraRuntimeParams
 from .mlp import MLP, FusedGatedMLP, GatedMLP
-from .moe import MOE, MoeConfig
+from .moe import MOE, MoeConfig, SharedMoE
 from .normalization import GroupNorm, LayerNorm, RmsNorm
 from .pooling import AvgPool2d
 from .recurrent import FusedRgLru, GroupedLinear, Recurrent, RgLru
@@ -36,8 +35,6 @@ __all__ = [
     'ColumnLinear',
     'Linear',
     'RowLinear',
-    'QKVColumnLinear',
-    'ParallelLMHead',
     'AttentionMaskType',
     'PositionEmbeddingType',
     'Attention',
@@ -64,6 +61,7 @@ __all__ = [
     'LoraRuntimeParams',
     'MOE',
     'MoeConfig',
+    'SharedMoE',
     'Mamba',
     'Mamba2',
     'Recurrent',

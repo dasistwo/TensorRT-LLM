@@ -1,0 +1,2 @@
+0e361ba639fa897f489f6d0f48cfe13f tensorrt_llm_executor_static.lib
+7adf157833793b3215570b0a95b9c4b2998a620c commit

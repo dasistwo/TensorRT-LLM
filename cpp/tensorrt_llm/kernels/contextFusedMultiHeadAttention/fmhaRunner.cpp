@@ -200,7 +200,15 @@ void FusedMHARunnerV2::setupKernelParams(MHARunnerParams runnerParams)
     mKernelParams.cu_q_seqlens = reinterpret_cast<int const*>(runnerParams.cuQSeqLenPtr);
     mKernelParams.tile_id_counter_ptr = reinterpret_cast<uint32_t*>(runnerParams.tileCounterPtr);
     // TRT doesn't support host scales. Use device scales instead.
-    mKernelParams.scale_bmm2_d = reinterpret_cast<uint32_t const*>(runnerParams.scaleBmm2Ptr);
+    // The scaleBmm1Ptr offset.
+    // 2 scales prepared for scaleBmm1 in the device memory: float scale, float (scale with log2e).
+    int64_t scaleBmm1PtrOffset = (mLaunchParams.useBase2ExpTrick ? 1 : 0);
+    // Only fp8 kernels need to load scales from the device memory.
+    if (mFixedParams.dataType == DATA_TYPE_E4M3)
+    {
+        mKernelParams.scale_bmm1_d = reinterpret_cast<uint32_t const*>(runnerParams.scaleBmm1Ptr + scaleBmm1PtrOffset);
+        mKernelParams.scale_bmm2_d = reinterpret_cast<uint32_t const*>(runnerParams.scaleBmm2Ptr);
+    }
 
     // Separate q and kv buffers may have different q and kv sequence lengths.
     if (mFixedParams.attentionInputLayout != AttentionInputLayout::PACKED_QKV)
@@ -259,6 +267,7 @@ void FusedMHARunnerV2::setupLaunchParams(MHARunnerParams runnerParams)
     bool const isSm90 = (mSM == kSM_90);
     bool const isSm8x = (mSM == kSM_86 || mSM == kSM_89);
     bool const isSm80 = (mSM == kSM_80);
+    bool const isSm89 = (mSM == kSM_89);
 
     // Sliding_window_causal mask.
     if (runnerParams.kvSeqLen > runnerParams.slidingWindowSize
@@ -303,7 +312,12 @@ void FusedMHARunnerV2::setupLaunchParams(MHARunnerParams runnerParams)
         mLaunchParams.kernel_s = 0;
         mLaunchParams.force_unroll = true;
         // enable tiled kernels on Ampere/Ada
-        if (mLaunchParams.flash_attention && runnerParams.kvSeqLen <= 64)
+        if (isSm89 && mFixedParams.dataType == DATA_TYPE_E4M3)
+        {
+            // so far Ada QMMA only supports non-tiled kernels.
+            mLaunchParams.granular_tiling = false;
+        }
+        else if (mLaunchParams.flash_attention && runnerParams.kvSeqLen <= 64)
         {
             // flash attention tiled kernels allows larger free dim tile size (M, N) with flexibility
             // in unroll dimension tile size (K). for short sequence length (s<=128), tiled kernels

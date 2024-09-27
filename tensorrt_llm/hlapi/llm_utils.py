@@ -15,6 +15,7 @@ __all__ = [
     'BuildConfig',
     'BuildCacheConfig',
     'QuantConfig',
+    'CalibConfig',
     'CachedModelLoader',
     'ConfigArbitrateError',
     '_ConfigArbitrator',
@@ -30,7 +31,7 @@ from argparse import Namespace
 from dataclasses import asdict, dataclass, field, fields
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, Union
 
 import tensorrt as trt
 import torch
@@ -46,9 +47,8 @@ from ..bindings.executor import (BatchingType, CapacitySchedulerPolicy,
 from ..builder import BuildConfig, Engine, EngineConfig, build
 from ..logger import logger
 from ..mapping import Mapping
-from ..models import MODEL_MAP
-from ..models.modeling_utils import (PretrainedConfig, QuantAlgo, QuantConfig,
-                                     TopModelMixin)
+from ..models.automodel import MODEL_MAP, AutoConfig, AutoModelForCausalLM
+from ..models.modeling_utils import PretrainedConfig, QuantAlgo, QuantConfig
 from ..module import Module
 from .build_cache import (BuildCache, BuildCacheConfig, CachedStage,
                           get_build_cache_config_from_env)
@@ -56,8 +56,7 @@ from .mpi_session import MPINodeState, MpiSession
 from .tokenizer import TokenizerBase, TransformersTokenizer, tokenizer_factory
 # TODO[chunweiy]: move the following symbols back to utils scope, and remove the following import
 from .utils import (GpuArch, download_hf_model, download_hf_pretrained_config,
-                    file_with_glob_exists, file_with_suffix_exists,
-                    print_colored, print_traceback_on_error)
+                    print_colored, print_traceback_on_error, set_docstring)
 
 
 @dataclass
@@ -115,6 +114,36 @@ class _ParallelConfig:
         return self.world_size > 1
 
 
+@dataclass(slots=True)
+class CalibConfig:
+    """
+    Calibration configuration.
+
+    Args:
+        device (Literal['cuda', 'cpu'], default='cuda'): The device to run calibration.
+        calib_dataset (str, default='cnn_dailymail'): The name or local path of calibration dataset.
+        calib_batches (int, default=512): The number of batches that the calibration runs.
+        calib_batch_size (int, default=1): The batch size that the calibration runs.
+        calib_max_seq_length (int, default=512): The maximum sequence length that the calibration runs.
+        random_seed (int, default=1234): The random seed used for calibration.
+        tokenizer_max_seq_length (int, default=2048): The maximum sequence length to initialize tokenizer for calibration.
+    """
+    device: Literal['cuda', 'cpu'] = 'cuda'
+    calib_dataset: str = 'cnn_dailymail'
+    calib_batches: int = 512
+    calib_batch_size: int = 1
+    calib_max_seq_length: int = 512
+    random_seed: int = 1234
+    tokenizer_max_seq_length: int = 2048
+
+    @classmethod
+    def from_dict(cls, config: dict):
+        return cls(**config)
+
+    def to_dict(self):
+        return asdict(self)
+
+
 class _ModelFormatKind(Enum):
     HF = 0
     TLLM_CKPT = 1
@@ -152,12 +181,9 @@ class _ModelInfo:
         raise NotImplementedError()
 
 
-@dataclass
-class LlmArgs:
-    '''
-    The arguments for constructing a LLM instance.
-
-    Parameters:
+LLMARGS_STAET_DOCSTRING = "The arguments for constructing a LLM instance.\n\nParameters:\n"
+# The arguments locate in LLM class's explicit arg-list.
+LLMARGS_EXPLICIT_ARGS_DOCSTRING = r"""
     model (str or Path): The model name or a local model directory.
         Note that if the value could be both a model name or a local model directory,
         the local model directory will be prioritized.
@@ -184,11 +210,27 @@ class LlmArgs:
     revision (str, optional): The revision of the model to use.
         Default is None.
 
+    load_format (Literal['auto', 'dummy'], default='auto'): The format of the model weights to load.
+        * 'auto' will try to load the weights from the provided checkpoint.
+        * 'dummy' will initialize the weights with random values, which is mainly for profiling.
+
+    enable_lora (bool, default=False): Enable LoRA adapters.
+
+    max_lora_rank (int, default=None): Maximum LoRA rank. If specified, it overrides `build_config.lora_config.max_lora_rank`.
+
+    max_loras (int, default=4): Maximum number of LoRA adapters to be stored in GPU memory.
+
+    max_cpu_loras (int, default=4): Maximum number of LoRA adapters to be stored in CPU memory.
+"""
+
+LLMARGS_REMAINING_ARGS_DOCSTRING = r"""
     build_config (BuildConfig, default=BuildConfig()): The build configuration for the model.
         Default is an empty BuildConfig instance.
 
     quant_config (QuantConfig, default=QuantConfig()): The quantization configuration for the model.
         Default is an empty QuantConfig instance.
+
+    calib_config (CalibConfig, default=CalibConfig()): The calibration configuration for the model.
 
     embedding_parallel_mode (str, default="SHARDING_ALONG_VOCAB"): The parallel mode for embeddings.
 
@@ -224,7 +266,13 @@ class LlmArgs:
         Default is None.
 
     enable_tqdm (bool, default=False): Whether to display a progress bar during model building.
-    '''
+"""
+
+
+@set_docstring(LLMARGS_STAET_DOCSTRING + LLMARGS_EXPLICIT_ARGS_DOCSTRING +
+               LLMARGS_REMAINING_ARGS_DOCSTRING)
+@dataclass
+class LlmArgs:
 
     model: Union[str, Path]
 
@@ -241,10 +289,23 @@ class LlmArgs:
 
     revision: Optional[str] = None
 
+    load_format: Literal['auto', 'dummy'] = 'auto'
+
+    # LoRA arguments
+    enable_lora: bool = False
+
+    max_lora_rank: Optional[int] = None
+
+    max_loras: int = 4
+
+    max_cpu_loras: int = 4
+
     # BuildConfig is introduced to give users a familiar interface to configure the model building.
     build_config: Optional[BuildConfig] = None
 
     quant_config: QuantConfig = field(default_factory=QuantConfig)
+
+    calib_config: CalibConfig = field(default_factory=CalibConfig)
 
     # A handful of options from PretrainedConfig
     embedding_parallel_mode: str = 'SHARDING_ALONG_VOCAB'
@@ -282,6 +343,11 @@ class LlmArgs:
         # chunked context is disabled by default, and it is recommended to keep it enabled.
         # The underlying implementation might disable it if it is not supported.
         self.enable_chunked_context: bool = False
+
+        # TODO[chunweiy]: Enable this option in the future
+        # Currently we want HLAPI to be consistent with the lower APIs in the model building, thus disable this to avoid
+        # magics.
+        self.perform_config_arbitration = False
 
         if self.skip_tokenizer_init:
             self.tokenizer = None
@@ -386,6 +452,19 @@ class LlmArgs:
 
         self.build_config = self.build_config or BuildConfig()
 
+        if self.enable_lora:
+            self.build_config.plugin_config.lora_plugin = 'auto'
+            if self.max_lora_rank is not None:
+                self.build_config.lora_config.max_lora_rank = self.max_lora_rank
+
+        if self.perform_config_arbitration:
+            self._perform_config_arbitration()
+
+    def _perform_config_arbitration(self):
+        '''
+        Arbitrate the configurations for the model building. The configs between different functional or performance
+        features might be confilcted, and this method will arbitrate the conflicts and raise errors if necessary.
+        '''
         self._config_arbitrator = _ConfigArbitrator()
         if self.build_config_mutable:
             if not self.build_config.max_num_tokens:
@@ -415,6 +494,8 @@ class LlmArgs:
                                 kv_cache_config=self.kv_cache_config,
                                 build_config=self.build_config)
 
+        self._config_arbitrator = None
+
     def _check_model_or_model_dir(self):
         if not self.model:
             raise ValueError("model should be provided.")
@@ -434,7 +515,7 @@ class LlmArgs:
 
     @property
     def model_dir(self) -> Path:
-        assert self.is_local_model
+        assert self.is_local_model, f"model_dir is only available for local model, {self.model}."
         return self.model
 
     @property
@@ -558,9 +639,10 @@ class LlmArgs:
             raise ValueError(
                 "KvCacheConfig.max_attention_window should be set for streaming LLM."
             )
-        if self.kv_cache_config.max_attention_window <= 0:
+        if any(i <= 0 for i in self.kv_cache_config.max_attention_window):
             raise ValueError(
-                "KvCacheConfig.max_attention_window should be greater than 0.")
+                "Elements in KvCacheConfig.max_attention_window should be greater than 0."
+            )
 
         if self.kv_cache_config.sink_token_length is None:
             raise ValueError(
@@ -597,7 +679,8 @@ class LlmArgs:
 
     def __getstate__(self):
         state = self.__dict__.copy()
-        del state['_config_arbitrator']
+        if '_config_arbitrator' in state:
+            del state['_config_arbitrator']
         return state
 
 
@@ -721,7 +804,6 @@ class _ModelRuntimeContext:
     It could be a runtime cache in MPI nodes.
     '''
     engine_buffer: Optional[trt.IHostMemory] = None
-    tokenizer: Optional[TokenizerBase] = None
     # engine_config is only used for saving the engine to disk
     engine_config: Optional[Union[dict, EngineConfig]] = None
     mapping: Optional[Mapping] = None
@@ -748,11 +830,9 @@ class ModelLoader:
 
     def __init__(self,
                  llm_args: LlmArgs,
-                 tokenizer: Optional[TokenizerBase],
                  workspace: Optional[str | tempfile.TemporaryDirectory] = None,
                  llm_build_stats: Optional["LlmBuildStats"] = None):
         self.llm_args = llm_args
-        self.tokenizer = tokenizer
         self._workspace = workspace or tempfile.TemporaryDirectory()
         self.llm_build_stats = llm_build_stats or LlmBuildStats()
 
@@ -901,9 +981,6 @@ class ModelLoader:
         if self.llm_args.parallel_config.is_multi_gpu:
             torch.cuda.set_device(self.rank)
 
-        len(self._build_pipeline)
-        to_log = self.rank == 0
-
         pipeline = ModelLoader.BuildPipeline(
             self.llm_args.enable_tqdm,
             [label for label, _ in self._build_pipeline],
@@ -920,7 +997,6 @@ class ModelLoader:
         assert engine_dir
 
         runtime_context = _ModelRuntimeContext(
-            tokenizer=self.tokenizer,
             engine_buffer=self._engine_buffer,
             engine_config=config,
             mapping=self.mapping,
@@ -982,20 +1058,30 @@ class ModelLoader:
     @staticmethod
     def get_model_format(model_dir: str) -> _ModelFormatKind:
         ''' Get the format of the model.  '''
-        # TODO: migrate to detect version field in config.json after TRTLLM-256 finished
-        if Path.exists(
-                Path(model_dir) / 'config.json') and file_with_glob_exists(
-                    model_dir, 'rank*.safetensors'):
-            return _ModelFormatKind.TLLM_CKPT
-        if (Path.exists(Path(model_dir) / 'config.json')
-                and (file_with_suffix_exists(model_dir, '.bin')
-                     or file_with_suffix_exists(model_dir, '.safetensors'))):
-            return _ModelFormatKind.HF
-        if Path.exists(
-                Path(model_dir) / 'config.json') and file_with_suffix_exists(
-                    model_dir, '.engine'):
-            return _ModelFormatKind.TLLM_ENGINE
-        raise ValueError(f"Unknown model format for {model_dir}")
+        if not (Path(model_dir) / 'config.json').exists():
+            raise ValueError(
+                f"Failed to infer model format because no config.json exists in {model_dir}"
+            )
+
+        with open(Path(model_dir) / 'config.json') as f:
+            config = json.load(f)
+
+        try:
+            if 'pretrained_config' in config and 'build_config' in config:
+                model_format = _ModelFormatKind.TLLM_ENGINE
+                EngineConfig.from_json_file(Path(model_dir) / 'config.json')
+            elif 'architecture' in config and 'dtype' in config:
+                model_format = _ModelFormatKind.TLLM_CKPT
+                PretrainedConfig.from_checkpoint(model_dir)
+            else:
+                model_format = _ModelFormatKind.HF
+                AutoConfig.from_hugging_face(model_dir)
+        except Exception as e:
+            raise ValueError(
+                f"Inferred model format {model_format}, but failed to load config.json: {e}"
+            )
+        else:
+            return model_format
 
     def _download_hf_model(self):
         ''' Download HF model from third-party model hub like www.modelscope.cn or huggingface.  '''
@@ -1007,31 +1093,26 @@ class ModelLoader:
             # this will download only once when multiple MPI processes are running
             model_dir = download_hf_model(self.llm_args.model,
                                           revision=self.llm_args.revision)
+            print_colored(f"Downloaded model to {model_dir}\n", 'grey')
         # Make all the processes got the same model_dir
         self._model_dir = mpi_broadcast(model_dir, root=0)
         self.llm_args.model = Path(self._model_dir)  # mark as a local model
-        print_colored(f"Downloaded model to {self._model_dir}\n", 'grey')
+        assert self.llm_args.is_local_model
 
     def _load_model_from_hf(self):
         ''' Load a TRT-LLM model from a HF model. '''
         assert self._model_dir is not None
-
-        import transformers
-        hf_config = transformers.AutoConfig.from_pretrained(
-            self._model_dir, trust_remote_code=True)
-        architecture = hf_config.architectures[0]
-
-        if architecture not in MODEL_MAP:
-            raise KeyError(f"Unsupported model architecture: {architecture}")
-        model_cls = MODEL_MAP[architecture]
-        if TopModelMixin.__name__ in model_cls.from_hugging_face.__qualname__:
-            raise NotImplementedError(
-                f"Unsupported model architecture in HLAPI: {architecture}")
-
-        use_weight_only = self.llm_args.quant_config.quant_algo in (
-            QuantAlgo.W4A16, QuantAlgo.W8A16)
-        if self.llm_args.quant_config.quant_mode.has_any_quant(
-        ) and not use_weight_only:
+        model_cls = AutoModelForCausalLM.get_trtllm_model_class(self._model_dir)
+        if self.llm_args.load_format == 'dummy':
+            config = model_cls.config_class.from_hugging_face(
+                str(self._model_dir),
+                dtype=self.llm_args.dtype,
+                mapping=self.mapping,
+                quant_config=self.llm_args.quant_config,
+                **self.convert_checkpoint_options,
+            )
+            self.model = model_cls(config)
+        elif self.llm_args.quant_config.requires_calibration:
             assert self.workspace is not None
             checkpoint_dir = f"{self.workspace}/quantized-checkpoint"
             if self.rank == 0:
@@ -1041,6 +1122,7 @@ class ModelLoader:
                     dtype=self.llm_args.dtype,
                     mapping=self.mapping,
                     quant_config=self.llm_args.quant_config,
+                    **self.llm_args.calib_config.to_dict(),
                 )
             if self.llm_args.parallel_config.is_multi_gpu:
                 mpi_barrier()
@@ -1067,12 +1149,16 @@ class ModelLoader:
             os.path.join(self._model_dir, 'config.json'))
         self.pretrained_config.mapping = self.mapping
 
+        #TODO: TRTLLM-1091, change the architecture in the checkpoint to TRT-LLM one, not HF one.
         architecture = self.pretrained_config.architecture
         assert architecture in MODEL_MAP, \
             f"Unsupported model architecture: {architecture}"
         model_cls = MODEL_MAP[architecture]
-        self.model = model_cls.from_checkpoint(self._model_dir,
-                                               config=self.pretrained_config)
+        if self.llm_args.load_format == 'dummy':
+            self.model = model_cls(self.pretrained_config)
+        else:
+            self.model = model_cls.from_checkpoint(
+                self._model_dir, config=self.pretrained_config)
         self._model_info = _ModelInfo.from_pretrained_config(
             self.pretrained_config)
 
@@ -1087,15 +1173,15 @@ class ModelLoader:
         self._model_info = _ModelInfo.from_module(self.model)
 
     def _build_engine(self):
-
-        self.build_config.update(auto_parallel_config=self.auto_parallel_config)
-        if self.auto_parallel_config.enabled:
-            self.model.config.mapping.rank = self.rank
-        assert self.model is not None, "model is loaded yet."
-
         assert isinstance(
             self.build_config,
             BuildConfig), f"build_config is not set yet: {self.build_config}"
+
+        self.build_config.update(auto_parallel_config=self.auto_parallel_config)
+        self.build_config.update_kv_cache_type(self._model_info.architecture)
+        if self.auto_parallel_config.enabled:
+            self.model.config.mapping.rank = self.rank
+        assert self.model is not None, "model is loaded yet."
 
         engine = build(self.model, self.build_config)
 
@@ -1149,7 +1235,8 @@ class ModelLoader:
                                                          truncation_side='left',
                                                          trust_remote_code=True,
                                                          use_fast=True)
-        except:
+        except Exception as e:
+            logger.error(f"Failed to load tokenizer from {model_dir}: {e}")
             return None
 
 
@@ -1226,7 +1313,8 @@ class CachedModelLoader:
         _enable_build_cache, _ = get_build_cache_config_from_env()
 
         return (self.llm_args.enable_build_cache or _enable_build_cache) and (
-            self.llm_args.model_format is _ModelFormatKind.HF)
+            self.llm_args.model_format is _ModelFormatKind.HF
+        ) and not self.llm_args.parallel_config.auto_parallel
 
     def _get_engine_cache_stage(self) -> CachedStage:
         '''
@@ -1262,16 +1350,7 @@ class CachedModelLoader:
         # The build() doesn't need the real model instance to get a updated BuildConig. What is really needed is the
         # dtype. That's why the model will be downloaded from HF if necessary to get the accurate dtype.
 
-        import transformers
-        hf_config = transformers.AutoConfig.from_pretrained(
-            model_dir, trust_remote_code=True)
-        architecture = hf_config.architectures[0]
-
-        if architecture not in MODEL_MAP:
-            raise KeyError(f"Unsupported model architecture: {architecture}")
-        model_cls = MODEL_MAP[architecture]
-        config_cls = model_cls.config_class
-        pretrained_config = config_cls.from_hugging_face(
+        pretrained_config = AutoConfig.from_hugging_face(
             model_dir,
             mapping=Mapping(world_size=llm_args.parallel_config.world_size,
                             tp_size=llm_args.parallel_config.tp_size,
@@ -1301,27 +1380,23 @@ class CachedModelLoader:
 
         def build_task():
             if model_format is not _ModelFormatKind.TLLM_ENGINE:
+                model_loader_kwargs = {
+                    'llm_args': self.llm_args,
+                    'workspace': self.workspace.name,
+                    'llm_build_stats': self.llm_build_stats,
+                }
 
                 if self.llm_args.parallel_config.is_multi_gpu:
                     assert self.mpi_session
                     # The engine_dir:Path will be stored to MPINodeState.state
                     build_infos = self.mpi_session.submit_sync(
                         CachedModelLoader._node_build_task,
-                        llm_args=self.llm_args,
-                        tokenizer=self.llm_args.
-                        tokenizer,  # TODO[chunweiy]: Use llm_args directly
-                        dtype=self.llm_args.dtype,
-                        engine_dir=self.get_engine_dir())
+                        engine_dir=self.get_engine_dir(),
+                        **model_loader_kwargs)
                     self.llm_build_stats.build_steps_info = build_infos[0]
 
                 else:  # single-gpu
-
-                    with ModelLoader(self.llm_args,
-                                     tokenizer=self.llm_args.tokenizer,
-                                     workspace=self.workspace.name,
-                                     llm_build_stats=self.llm_build_stats
-                                     ) as model_loader:
-
+                    with ModelLoader(**model_loader_kwargs) as model_loader:
                         model_loader(self.get_engine_dir())
 
                 release_gc()
@@ -1339,17 +1414,16 @@ class CachedModelLoader:
     @staticmethod
     def _node_build_task(
         llm_args: LlmArgs,
-        tokenizer: Optional[TokenizerBase] = None,
-        dtype: str = 'auto',
+        workspace: Optional[str | tempfile.TemporaryDirectory] = None,
+        llm_build_stats: Optional['LlmBuildStats'] = None,
         engine_dir: Optional[Path] = None,
     ):
         if MPINodeState.is_initialized():
             raise RuntimeError("The MPI node is already initialized.")
 
-        with ModelLoader(
-                llm_args,
-                tokenizer=tokenizer,
-        ) as model_loader:
+        with ModelLoader(llm_args,
+                         workspace=workspace,
+                         llm_build_stats=llm_build_stats) as model_loader:
             model_loader(engine_dir=engine_dir)
             return model_loader.llm_build_stats.build_steps_info
 

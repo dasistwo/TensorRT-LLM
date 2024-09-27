@@ -1,15 +1,18 @@
 import asyncio
 import atexit
+import concurrent.futures
 import datetime
+import json
 import secrets
-import threading
 import time
+import traceback
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from multiprocessing.connection import Client, Listener
 from pathlib import Path
 from queue import Queue
-from typing import Any, Dict, Generator, List, Optional, Tuple, Union
+from typing import (Any, Dict, Generator, List, NamedTuple, Optional, Tuple,
+                    Union)
 
 import numpy as np
 import torch
@@ -17,11 +20,14 @@ from janus import Queue as AsyncQueue
 
 from ._utils import mpi_rank, mpi_world_size
 from .bindings import executor as tllm
+from .builder import ConfigEncoder, Engine, EngineConfig
 from .hlapi.mpi_session import (MpiPoolSession, MpiSession,
                                 external_mpi_comm_available, find_free_port,
                                 need_spawn_mpi_workers)
-from .hlapi.utils import (ContextManager, SamplingParams, exception_handler,
-                          print_traceback_on_error)
+from .hlapi.utils import ManagedThread, SamplingParams, exception_handler
+from .lora_manager import LoraManager
+from .runtime import ModelConfig
+from .runtime.model_runner import _engine_config_to_model_config
 
 
 def has_event_loop() -> bool:
@@ -32,12 +38,35 @@ def has_event_loop() -> bool:
     return True
 
 
+@dataclass(slots=True)
+class LoRARequest:
+    lora_name: str
+    lora_int_id: int
+    lora_path: str = ""
+
+    def __post_init__(self):
+        assert self.lora_path, "lora_path cannot be empty"
+
+    @property
+    def adapter_id(self):
+        return self.lora_int_id
+
+    @property
+    def name(self):
+        return self.lora_name
+
+    @property
+    def path(self):
+        return self.lora_path
+
+
 class GenerationRequest:
 
     def __init__(
         self,
         prompt_token_ids: Union[torch.Tensor, np.ndarray, list],
         sampling_params: SamplingParams,
+        lora_request: Optional[LoRARequest] = None,
         streaming: bool = False,
     ):
         if isinstance(prompt_token_ids, list):
@@ -50,48 +79,13 @@ class GenerationRequest:
             )
 
         self.sampling_params = sampling_params
+        self.lora_request = lora_request
         self.streaming = streaming
         self.id = -1
 
     def set_id(self, id):
         self.id = id
         return self
-
-    def as_executor_request(self) -> tllm.Request:
-        request_kwargs = {
-            "input_token_ids":
-            self.prompt_token_ids,
-            "max_new_tokens":
-            self.sampling_params.max_new_tokens,
-            "streaming":
-            self.streaming,
-            "sampling_config":
-            self.sampling_params._get_sampling_config(),
-            "end_id":
-            self.sampling_params.end_id,
-            "pad_id":
-            self.sampling_params.pad_id,
-            "output_config":
-            self.sampling_params._get_output_config(),
-            # The following options in the Executor API are not yet exposed by the HLAPI:
-            # https://jirasw.nvidia.com/browse/TRTLLM-489
-            "bad_words":
-            self.sampling_params._get_bad_words(),
-            "stop_words":
-            self.sampling_params._get_stop_words(),
-            "embedding_bias":
-            self.sampling_params.embedding_bias,
-            "external_draft_tokens_config":
-            self.sampling_params.external_draft_tokens_config,
-            "prompt_tuning_config":
-            self.sampling_params.prompt_tuning_config,
-            "lora_config":
-            self.sampling_params.lora_config,
-            "logits_post_processor_name":
-            self.sampling_params.logits_post_processor_name,
-        }
-        request = tllm.Request(**request_kwargs)
-        return request
 
 
 @dataclass(slots=True)
@@ -125,9 +119,29 @@ class CompletionOutput:
         return diff
 
 
-class GenerationResult:
+class CppExecutorError(RuntimeError):
 
-    def __init__(self, generation_request: GenerationRequest) -> None:
+    def __init__(self, message: Optional[str] = None):
+        self.message = message
+        self.stack_trace = traceback.format_exc()
+        super().__init__(message)
+
+    def __str__(self):
+        return f"{self.message}\nStack trace:\n{self.stack_trace}"
+
+
+class GenerationResult:
+    '''
+    The result of a generation request. It can be used to wait for the completion of the request.
+
+    Args:
+        generation_request (GenerationRequest): The generation request object.
+        background_error_handler (Optional[callable]): The error handler to process the errors from the background threads/processes.
+    '''
+
+    def __init__(self,
+                 generation_request: GenerationRequest,
+                 background_error_handler: Optional[callable] = None) -> None:
         self._done = False
         self._cancelled = False
         self._generation_request = generation_request
@@ -144,6 +158,8 @@ class GenerationResult:
             CompletionOutput(i) for i in range(self.beam_width)
         ]
         self.context_logits: Optional[torch.Tensor] = None
+
+        self._background_error_handler = background_error_handler
 
     @property
     def request_id(self) -> int:
@@ -165,21 +181,27 @@ class GenerationResult:
     def beam_width(self):
         return self._generation_request.sampling_params.beam_width
 
-    def handle_generation_msg(self, tensors: tuple, error: str):
-        if error:
-            raise RuntimeError(error)
+    def handle_response(self, response: "GenerationExecutor.Response"):
 
-        output_token_ids, context_logits, generation_logits, log_probs, cum_log_probs = tensors
+        if response.error:
+            if isinstance(response.error, Exception):
+                raise response.error
+            else:
+                raise CppExecutorError(response.error)
 
-        for i, beam_ids in enumerate(output_token_ids):
+        self._done = response.is_final
+
+        tensors = response.tensors
+
+        for i, beam_ids in enumerate(tensors.output_token_ids):
             self.outputs[i].token_ids.extend(beam_ids)
-            if cum_log_probs is not None:
-                self.outputs[i].cumulative_logprob = cum_log_probs[i]
-            if log_probs is not None:
-                self.outputs[i].logprobs = log_probs[i]
+            if tensors.cum_log_probs is not None:
+                self.outputs[i].cumulative_logprob = tensors.cum_log_probs[i]
+            if tensors.log_probs is not None:
+                self.outputs[i].logprobs = tensors.log_probs[i]
                 assert len(self.outputs[i].logprobs) == self.outputs[i].length
-            if generation_logits is not None:
-                self.outputs[i].generation_logits = generation_logits[
+            if tensors.generation_logits is not None:
+                self.outputs[i].generation_logits = tensors.generation_logits[
                     i, :self.outputs[i].length]
 
         if self.finished and not self._generation_request.sampling_params.include_stop_str_in_output:
@@ -191,17 +213,21 @@ class GenerationResult:
                             stop_ids)]
                         break
 
-        if context_logits is not None:
-            self.context_logits = context_logits
+        if tensors.context_logits is not None:
+            self.context_logits = tensors.context_logits
+
+        # Processing background errors here ASAF during generation.
+        if self._background_error_handler:
+            self._background_error_handler()
 
     def result_step(self, timeout: Optional[float] = None):
-        _, tensors, self._done, error = self.queue.get(timeout=timeout)
-        self.handle_generation_msg(tensors, error)
+        response = self.queue.get(timeout=timeout)
+        self.handle_response(response)
 
     async def aresult_step(self):
         assert self.aqueue is not None, "The asyncio event loop was not present during initialization, so async operations are not available."
-        _, tensors, self._done, error = await self.aqueue.get()
-        self.handle_generation_msg(tensors, error)
+        response = await self.aqueue.get()
+        self.handle_response(response)
 
     def result(self, timeout: Optional[float] = None) -> "GenerationResult":
         while not self._done:
@@ -269,29 +295,47 @@ class GenerationResult:
         repr = f"{self.__class__.__name__}({repr})"
         return repr
 
+    def __hash__(self):
+        return hash(self.request_id)
+
 
 class GenerationExecutor(ABC):
-    TERMINATE_REQUEST_ID = 0
+
+    PENDING_REQ_ID_TIMEOUT = 2  # second
+
+    class ResponseTensors(NamedTuple):
+        output_token_ids: list
+        context_logits: Optional[torch.Tensor]
+        generation_logits: Optional[torch.Tensor]
+        log_probs: Optional[list]
+        cum_log_probs: Optional[list]
+
+    class Response(NamedTuple):
+        """ The response from the cpp-executor to the Python main thread. """
+        request_id: int
+        tensors: Optional["GenerationExecutor.ResponseTensors"]
+        is_final: Optional[bool]
+        # error is either str from cpp-executor or a Exception from Python threads/processes
+        error: Optional[str | Exception]
+
+    @dataclass(slots=True)
+    class PendingResponse:
+        response: "GenerationExecutor.Response"
+        start_time: float  # this is used to track the latency before the response is dispatched.
 
     def __init__(self):
-        self.id_counter = GenerationExecutor.TERMINATE_REQUEST_ID + 1
         self._stats = None
         self.stats_queue = None
 
-        exception_handler.register(self)
+        # This is used to capture the exceptions from the threads.
+        self._error_queue = Queue()
+
+        # mapping of pending request_id -> response
+        self._pending_responses: Dict[
+            int, List[GenerationExecutor.PendingResponse]] = {}
+
+        exception_handler.register(self, 'shutdown')
         atexit.register(self.shutdown)
-
-    def generate_id(self) -> int:
-        gen_id = self.id_counter
-
-        # underlying C type is uint64
-        uint64_max = 2**64 - 1
-        self.id_counter = (self.id_counter + 1) % uint64_max
-
-        if self.id_counter == GenerationExecutor.TERMINATE_REQUEST_ID:
-            self.id_counter += 1
-
-        return gen_id
 
     @abstractmethod
     def submit(self, request: GenerationRequest) -> GenerationResult:
@@ -301,6 +345,7 @@ class GenerationExecutor(ABC):
         self,
         prompt_token_ids: List[int],
         sampling_params: SamplingParams,
+        lora_request: Optional[LoRARequest] = None,
         streaming: bool = False,
     ) -> GenerationResult:
         """Generate output for the given prompt token ids in the asynchronous mode.
@@ -311,12 +356,15 @@ class GenerationExecutor(ABC):
         result = self.submit(
             GenerationRequest(prompt_token_ids,
                               sampling_params=sampling_params,
+                              lora_request=lora_request,
                               streaming=streaming))
         return result
 
     def generate(
-        self, prompt_token_ids: Union[List[int], List[List[int]]],
-        sampling_params: Union[SamplingParams, List[SamplingParams]]
+        self,
+        prompt_token_ids: Union[List[int], List[List[int]]],
+        sampling_params: Union[SamplingParams, List[SamplingParams]],
+        lora_request: Optional[Union[LoRARequest, List[LoRARequest]]] = None,
     ) -> Union[GenerationResult, List[GenerationResult]]:
         """Generate output for the given prompt token ids in the synchronous mode.
         Synchronous generation accepts either single prompt or batched prompts.
@@ -332,7 +380,14 @@ class GenerationExecutor(ABC):
                 sp = sampling_params[i]
             else:
                 sp = sampling_params
-            future = self.generate_async(p, sampling_params=sp, streaming=False)
+            if isinstance(lora_request, list):
+                lora_req = lora_request[i]
+            else:
+                lora_req = lora_request
+            future = self.generate_async(p,
+                                         sampling_params=sp,
+                                         lora_request=lora_req,
+                                         streaming=False)
             futures.append(future)
 
         for future in futures:
@@ -342,6 +397,66 @@ class GenerationExecutor(ABC):
             futures = futures[0]
 
         return futures
+
+    def _handle_background_error(self):
+        """ Process the errors from the threads or processes.
+        NOTE: This should be called in the main thread.
+        """
+        # Here we raise the first error in the queue. This method will be called repeatedly and user can choose to catch
+        # more than one error.
+        if not self._error_queue.empty():
+            e = self._error_queue.get()
+            # We can catch some exceptions here.
+            raise e
+
+    def _to_delay_response(self,
+                           response: "GenerationExecutor.Response") -> bool:
+        ''' the engine.enqueue_request may not be finished in another thread, so we need to postpone it. '''
+        req_id = response.request_id
+        if req_id not in self._results:
+            self._pending_responses.setdefault(req_id, []).append(
+                self.PendingResponse(response, time.perf_counter()))
+            if time.perf_counter() - self._pending_responses[req_id][
+                    0].start_time > self.PENDING_REQ_ID_TIMEOUT:
+                raise TimeoutError(
+                    f"Request ID {req_id} not found in the results queue.")
+            return True
+
+        return False
+
+    def _cleanup_pending_responses(self, nowait=False) -> bool:
+        ''' Process the pending responses that are not found in the results. '''
+
+        def cleanup():
+            done_req_ids = set()
+            for req_id, responses in self._pending_responses.items():
+                if req_id not in self._results:
+                    if time.perf_counter(
+                    ) - responses[0].start_time > self.PENDING_REQ_ID_TIMEOUT:
+                        raise TimeoutError(
+                            f"Request ID {req_id} not found in the results queue."
+                        )
+                else:
+                    for response in responses:
+                        self._results[req_id].queue.put(
+                            response.response)  # dispatch
+                    done_req_ids.add(req_id)
+
+            for req_id in done_req_ids:
+                self._pending_responses.pop(req_id, None)
+
+            return not bool(self._pending_responses)
+
+        if nowait:
+            cleanup()
+        else:
+            # It is possible that some requests are still pending in the workers, we need to process them before shutdown
+            for _ in range(int(self.PENDING_REQ_ID_TIMEOUT / 0.1) + 1):
+                if cleanup(): break
+                time.sleep(0.1)
+                # It will raise TimeoutError if the pending responses are not processed in time.
+
+        return not bool(self._pending_responses)
 
     @abstractmethod
     def shutdown(self):
@@ -368,7 +483,7 @@ class GenerationExecutor(ABC):
 
     @staticmethod
     def create(
-        engine_dir: Path,
+        engine: Union[Path, Engine],
         executor_config: tllm.ExecutorConfig = tllm.ExecutorConfig(1),
         model_world_size: int = 1,
         world_size: int = 0,
@@ -386,7 +501,7 @@ class GenerationExecutor(ABC):
                 f"on {world_size} ranks.")
 
         worker_kwargs = {
-            "engine_dir": engine_dir,
+            "engine": engine,
             "executor_config": executor_config,
         }
 
@@ -411,25 +526,50 @@ class ExecutorBindingsWorker(GenerationExecutor):
 
     def __init__(
         self,
-        engine_dir: Path,
-        executor_config: tllm.ExecutorConfig = tllm.ExecutorConfig(1),
+        engine: Union[Path, Engine],
+        executor_config: tllm.ExecutorConfig = tllm.ExecutorConfig(1)
     ) -> None:
         super().__init__()
 
         self.engine = None
-        self._results: Dict[int, GenerationResult] = {}
-        self._pending: set = set()
         self.result_queue = None
         self.rank = mpi_rank()
+        self._results: Dict[int, GenerationResult] = {}
 
-        self.engine = tllm.Executor(engine_dir,
-                                    tllm.ModelType.DECODER_ONLY,
-                                    executor_config=executor_config)
-        self.awaiter_stop_event = threading.Event()
-        self.awaiter_thread = threading.Thread(target=self.awaiter_loop,
-                                               daemon=True)
-        self.stats_thread = threading.Thread(target=self.stats_loop,
-                                             daemon=True)
+        if isinstance(engine, list):
+            engine = engine[self.rank]
+
+        if isinstance(engine, Engine):
+            engine.regularize_managed_weights()
+            self.engine = tllm.Executor(engine.engine,
+                                        json.dumps(engine.config.to_dict(),
+                                                   cls=ConfigEncoder),
+                                        tllm.ModelType.DECODER_ONLY,
+                                        executor_config=executor_config,
+                                        managed_weights=engine.managed_weights
+                                        or {})
+        else:
+            self.engine = tllm.Executor(engine,
+                                        tllm.ModelType.DECODER_ONLY,
+                                        executor_config=executor_config)
+
+        self._lora_manager: Optional[LoraManager] = None
+        self._runtime_model_config: Optional[ModelConfig] = None
+        if self.rank == 0:
+            if isinstance(engine, Engine):
+                engine_config = engine.config
+            else:
+                engine_config = EngineConfig.from_json_file(
+                    f"{engine}/config.json")
+            if engine_config.build_config.plugin_config.lora_plugin:
+                self._runtime_model_config = _engine_config_to_model_config(
+                    engine_config)
+                self._lora_manager = LoraManager()
+
+        self.await_response_thread = ManagedThread(
+            self.await_response_task, error_queue=self._error_queue)
+        self.dispatch_stats_thread = ManagedThread(
+            self.dispatch_stats_task, error_queue=self._error_queue)
 
     def create_stats_queue(self):
         # Stats queue is created during first submission to ensure event loop exists if it is needed.
@@ -458,86 +598,157 @@ class ExecutorBindingsWorker(GenerationExecutor):
             send the message there.
             Otherwise, push the result directly in the GenerationResult queue.
         """
-
         if self.result_queue is not None:
             return self.result_queue
         return self._results[req_id].queue
 
     def start_awaiter_thread(self):
         if self.engine.can_enqueue_requests(
-        ) and not self.awaiter_thread.is_alive():
-            self.awaiter_thread.start()
+        ) and not self.await_response_thread.is_alive():
+            self.await_response_thread.start()
 
     def start_stats_thread(self):
         if self.engine.can_enqueue_requests(
-        ) and not self.stats_thread.is_alive():
-            self.stats_thread.start()
+        ) and not self.dispatch_stats_thread.is_alive():
+            self.dispatch_stats_thread.start()
 
-    def awaiter_loop(self):
-        """ Gets responses from executor and places in the return queue."""
-        while not self.awaiter_stop_event.is_set():
-            # Get responses and place in queue.
-            for response in self.engine.await_responses(
-                    timeout=datetime.timedelta(milliseconds=100)):
-                req_id = response.request_id
-                if response.has_error():
-                    self.return_queue(req_id).put(
-                        (req_id, None, None, response.error_msg))
-                else:
-                    tensors = (
-                        response.result.output_token_ids,
-                        response.result.context_logits,
-                        response.result.generation_logits,
-                        response.result.log_probs,
-                        response.result.cum_log_probs,
-                    )
-                    self.return_queue(req_id).put(
-                        (response.request_id, tensors, response.result.is_final,
-                         None))
-                    if response.result.is_final:
-                        self._pending.remove(req_id)
+    def await_response_task(self) -> bool:
+        # Get responses and place in queue.
 
-    def stats_loop(self):
-        while not self.awaiter_stop_event.is_set():
-            time.sleep(0.1)
-            # Get stats and place in queue.
-            for stats in self.engine.get_latest_iteration_stats():
-                while hasattr(self.stats_queue,
-                              "full") and self.stats_queue.full():
-                    self.stats_queue.get()
-                self.stats_queue.put(stats.to_json_str())
+        for response in self.engine.await_responses(timeout=datetime.timedelta(
+                milliseconds=100)):
+            req_id = response.request_id
+            if response.has_error():
+                rsp = self.Response(req_id,
+                                    tensors=None,
+                                    is_final=None,
+                                    error=response.error_msg)
+            else:
+                tensors = self.ResponseTensors(
+                    response.result.output_token_ids,
+                    response.result.context_logits,
+                    response.result.generation_logits,
+                    response.result.log_probs, response.result.cum_log_probs)
+
+                rsp = self.Response(req_id,
+                                    tensors,
+                                    is_final=response.result.is_final,
+                                    error=None)
+
+            if self._to_delay_response(rsp):
+                continue
+
+            self._cleanup_pending_responses(nowait=True)
+
+            queue = self.return_queue(req_id)
+            bck_error = self._error_queue.get_nowait(
+            ) if not self._error_queue.empty() else None
+
+            if bck_error is not None:
+                rsp = self.Response(req_id,
+                                    tensors=None,
+                                    is_final=None,
+                                    error=bck_error)
+
+            queue.put(rsp)
+
+            if response.result.is_final:
+                self._results.pop(req_id)
+
+        return True  # success
+
+    def dispatch_stats_task(self) -> bool:
+        time.sleep(0.1)
+        # Get stats and place in queue.
+        for stats in self.engine.get_latest_iteration_stats():
+            while hasattr(self.stats_queue, "full") and self.stats_queue.full():
+                self.stats_queue.get()
+            self.stats_queue.put(stats.to_json_str())
+
+        return True  # success
 
     def start(self):
         self.create_stats_queue()
         self.start_awaiter_thread()
         self.start_stats_thread()
 
+    def _load_lora_adapter(self, lora_request: LoRARequest):
+        self._lora_manager.load_from_ckpt(
+            [lora_request.lora_path],
+            model_config=self._runtime_model_config,
+            runtime_mapping=None,
+            uids=[str(lora_request.adapter_id)])
+
+    def _enqueue_request(self, request: GenerationRequest) -> int:
+        if self._lora_manager is not None and request.lora_request is not None:
+            self._load_lora_adapter(request.lora_request)
+            uid = str(request.lora_request.adapter_id)
+            lora_config = tllm.LoraConfig(
+                task_id=request.lora_request.adapter_id,
+                weights=self._lora_manager.cpp_lora_weights[uid],
+                config=self._lora_manager.cpp_lora_config[uid])
+        else:
+            lora_config = None
+
+        executor_request = tllm.Request(
+            input_token_ids=request.prompt_token_ids,
+            max_tokens=request.sampling_params.max_tokens,
+            max_new_tokens=request.sampling_params.max_new_tokens,
+            streaming=request.streaming,
+            sampling_config=request.sampling_params._get_sampling_config(),
+            end_id=request.sampling_params.end_id,
+            pad_id=request.sampling_params.pad_id,
+            output_config=request.sampling_params._get_output_config(),
+            bad_words=request.sampling_params._get_bad_words(),
+            stop_words=request.sampling_params._get_stop_words(),
+            embedding_bias=request.sampling_params.embedding_bias,
+            external_draft_tokens_config=request.sampling_params.
+            external_draft_tokens_config,
+            prompt_tuning_config=request.sampling_params.prompt_tuning_config,
+            lora_config=lora_config,
+            logits_post_processor_name=request.sampling_params.
+            logits_post_processor_name,
+        )
+        req_id = self.engine.enqueue_request(executor_request)
+        return req_id
+
     def submit(self, request: GenerationRequest) -> GenerationResult:
-        """
-            Low-level API to the executor. Return a "future" GenerationResult which can be waited.
-        """
+        """ Low-level API to the executor. Return a "future" GenerationResult which can be waited. """
         self.start()
 
         if self.rank != 0:
-            raise NotImplementedError("Only rank 0 can submit requests.")
-        req_id = self.engine.enqueue_request(request.as_executor_request())
+            raise RuntimeError(
+                "Only rank 0 can submit requests.\n"
+                "To fix this, ensure that the llm.generate(...) method is "
+                "guarded with the `if __name__ == '__main__':` block.")
+        req_id = self._enqueue_request(request)
+
         request.set_id(req_id)
 
-        result = GenerationResult(request)
+        result = GenerationResult(
+            request, background_error_handler=self._handle_background_error)
         self._results[req_id] = result
-        self._pending.add(req_id)
+
+        self._handle_background_error()
+
         return result
 
     def shutdown(self):
         if self.engine is not None:
-            self.awaiter_stop_event.set()
+            self.await_response_thread.stop()
+            self.dispatch_stats_thread.stop()
+
             if self.engine.can_enqueue_requests():
-                if self.awaiter_thread.is_alive():
-                    self.awaiter_thread.join()
-                if self.stats_thread.is_alive():
-                    self.stats_thread.join()
+                if self.await_response_thread.is_alive():
+                    self.await_response_thread.join()
+                if self.dispatch_stats_thread.is_alive():
+                    self.dispatch_stats_thread.join()
+
             self.engine.shutdown()
             self.engine = None
+
+        # Check if there are any errors from the threads before shutdown.
+        self._handle_background_error()
 
     def block_subordinates(self):
         if self.rank != 0:
@@ -559,32 +770,40 @@ class ExecutorBindingsWorker(GenerationExecutor):
     def wait_first_completed(
         self, futures: List[GenerationResult]
     ) -> Generator[GenerationResult, None, None]:
-        wait_set = set(f.request_id for f in futures)
+        wait_set = set(futures)
 
         # clear already-finished requests
         for f in futures:
             if f._done:
-                wait_set.remove(f.request_id)
+                wait_set.pop(f)
                 yield f
 
         # wait remaining active requests
         while len(wait_set) > 0:
-            req_id = wait_set.pop()
-
-            if req_id not in self._pending:
-                yield self._results[req_id]
+            fut = wait_set.pop()
+            if fut.request_id not in self._results:
+                yield fut
             else:
-                wait_set.add(req_id)
+                wait_set.add(fut)
 
 
-class Fifo:
+class IpcQueue:
+    ''' A Queue-like container for IPC. '''
 
-    def __init__(self, address: Tuple[str, int, bytes], *, is_server: bool):
-        self.address, self.authkey = (address[0], address[1]), address[2]
+    def __init__(self,
+                 address: Optional[Tuple[str, int, str]] = None,
+                 *,
+                 is_server: bool):
+
+        # NOTE: The port could be occupied by other processes if run in parallel.
+        address = address or ('localhost', find_free_port(),
+                              secrets.token_bytes(512))
+
+        self.host_port, self.authkey = (address[0], address[1]), address[2]
         self.is_server = is_server
         self.conn = None
         if is_server:
-            self.listener = Listener(self.address,
+            self.listener = Listener(self.host_port,
                                      'AF_INET',
                                      authkey=self.authkey)
 
@@ -592,7 +811,7 @@ class Fifo:
         if self.is_server:
             self.conn = self.listener.accept()
         else:
-            self.conn = Client(self.address, authkey=self.authkey)
+            self.conn = Client(self.host_port, authkey=self.authkey)
 
     def put(self, obj: Any):
         if self.conn is None:
@@ -603,6 +822,10 @@ class Fifo:
         if self.conn is None:
             self.setup()
         return self.conn.recv()
+
+    @property
+    def address(self) -> Tuple[str, int, bytes]:
+        return (self.host_port[0], self.host_port[1], self.authkey)
 
 
 class ExecutorBindingsProxy(GenerationExecutor):
@@ -617,49 +840,44 @@ class ExecutorBindingsProxy(GenerationExecutor):
 
         self.workers_started = False
 
-        request_queue_addr = ("127.0.0.1", find_free_port(),
-                              secrets.token_bytes(512))
-        self.request_queue = Fifo(request_queue_addr, is_server=True)
-
+        self.request_queue = IpcQueue(is_server=True)
         # Return request id back to dispatcher
-        request_id_queue_addr = ("127.0.0.1", find_free_port(),
-                                 secrets.token_bytes(512))
-        self.request_id_queue = Fifo(request_id_queue_addr, is_server=True)
-
-        result_queue_addr = ("127.0.0.1", find_free_port(),
-                             secrets.token_bytes(512))
-        self.result_queue = Fifo(result_queue_addr, is_server=True)
-
-        stats_queue_addr = ("127.0.0.1", find_free_port(),
-                            secrets.token_bytes(512))
-        self.mp_stats_queue = Fifo(stats_queue_addr, is_server=True)
+        self.request_id_queue = IpcQueue(is_server=True)
+        self.result_queue = IpcQueue(is_server=True)
+        self.mp_stats_queue = IpcQueue(is_server=True)
 
         self._results: Dict[int, GenerationResult] = {}
-        self._request_id_dispatcher_queue = Queue()
 
         if mpi_session is None:
             self.mpi_session = MpiPoolSession(n_workers=model_world_size)
         else:
             self.mpi_session = mpi_session
+
         self.model_world_size = model_world_size
 
         self.workers_kwargs = workers_kwargs
         self.workers_kwargs.update({
-            "request_queue_addr": request_queue_addr,
-            "request_id_queue_addr": request_id_queue_addr,
-            "result_queue_addr": result_queue_addr,
-            "stats_queue_addr": stats_queue_addr,
+            "request_queue_addr":
+            self.request_queue.address,
+            "request_id_queue_addr":
+            self.request_id_queue.address,
+            "result_queue_addr":
+            self.result_queue.address,
+            "stats_queue_addr":
+            self.mp_stats_queue.address,
         })
-        self.workers_init_ok = False
-        self.dispatcher = threading.Thread(target=self.dispatcher_thread,
-                                           daemon=True)
-        self.stats_thread = threading.Thread(target=self.stats_main,
-                                             daemon=True)
 
-    @print_traceback_on_error
+        self.dispatch_result_thread = ManagedThread(
+            self.dispatch_result_task, error_queue=self._error_queue)
+        self.dispatch_stats_thread = ManagedThread(
+            self.dispatch_stats_task, error_queue=self._error_queue)
+
+        exception_handler.register(self, 'shutdown')
+        atexit.register(self.shutdown)
+
     @staticmethod
     def workers_main(
-        engine_dir: Path,
+        engine: Union[Path, Engine],
         request_queue_addr: Tuple[str, int, bytes],
         request_id_queue_addr: Tuple[str, int, bytes],
         result_queue_addr: Tuple[str, int, bytes],
@@ -669,83 +887,118 @@ class ExecutorBindingsProxy(GenerationExecutor):
         result_queue = None
 
         if mpi_rank() == 0:
-            request_queue = Fifo(request_queue_addr, is_server=False)
-            request_id_queue = Fifo(request_id_queue_addr, is_server=False)
-            result_queue = Fifo(result_queue_addr, is_server=False)
-            mp_stats_queue = Fifo(stats_queue_addr, is_server=False)
+            request_queue = IpcQueue(request_queue_addr, is_server=False)
+            request_id_queue = IpcQueue(request_id_queue_addr, is_server=False)
+            result_queue = IpcQueue(result_queue_addr, is_server=False)
+            mp_stats_queue = IpcQueue(stats_queue_addr, is_server=False)
 
-        # Only the failure on rank0 can be captured here. All the non-rank0 process will hang once the executor runtime
-        # is successfully initialized, that is controlled within cpp runtime.
-        # To capture the failure on all the ranks, more work should be done in the cpp runtime.
-        # TODO[chunweiy]: fix the non-rank0 process failure
-        init_ok = True
+        def notify_proxy_threads_to_quit():
+            # Signal the dispatcher thread in the proxy to quit
+            result_queue.put(None)
+            # Signal the stats thread in the proxy to quit
+            mp_stats_queue.put(None)
+
         try:
-            executor = ExecutorBindingsWorker(engine_dir, executor_config)
+            executor = ExecutorBindingsWorker(engine, executor_config)
         except Exception as e:
-            init_ok = False
-            raise e
-        finally:
-            if mpi_rank() == 0:
-                result_queue.put(init_ok)
+            raise CppExecutorError(f"Failed to initialize executor: {e}") from e
 
-        with ContextManager(executor) as executor:
-            if mpi_rank() == 0:
-                executor.set_result_queue(result_queue)
-                executor.set_stats_queue(mp_stats_queue)
-                while (req := request_queue.get()) is not None:
-                    result = executor.submit(req)
-                    request_id_queue.put(result.request_id)
-
-                result_queue.put(None)
-                mp_stats_queue.put(None)
-            else:
+        with executor:
+            try:
                 executor.block_subordinates()
 
-    def dispatcher_thread(self):
-        """ Collect centralized results from result queue and dispatch them in the
-            correct GenerationResult queues. """
+                if mpi_rank() == 0:
+                    executor.set_result_queue(result_queue)
+                    executor.set_stats_queue(mp_stats_queue)
+                    while (req := request_queue.get()) is not None:
+                        result = executor.submit(req)
+                        request_id_queue.put(result.request_id)
 
-        while (res := self.result_queue.get()) is not None:
-            req_id, *_ = res
-            # Wait for this result ready in self._results
-            while req_id not in self._results:
-                self._request_id_dispatcher_queue.get()
+                    notify_proxy_threads_to_quit()
+
+            except ExecutorBindingsWorker.WorkerExit as e:
+                raise e
+
+            except Exception as e:  # other critical errors
+                if mpi_rank() == 0:
+                    notify_proxy_threads_to_quit()
+
+                raise CppExecutorError(f"Failed during generation: {e}") from e
+
+    def dispatch_result_task(self) -> bool:
+        # process the remaining pending req_ids before getting the next response, since the queue.get will block, we'd
+        # better to process the pending req_ids before queue.get.
+        self._cleanup_pending_responses(nowait=True)
+
+        if (res := self.result_queue.get()) is None:
+            return False  # shutdown the thread
+
+        req_id = res.request_id
+
+        if not self._to_delay_response(res):
             self._results[req_id].queue.put(res)
-            while not self._request_id_dispatcher_queue.empty():
-                self._request_id_dispatcher_queue.get()
 
-    def stats_main(self):
-        while (stats := self.mp_stats_queue.get()) is not None:
-            time.sleep(0.1)
-            while self.stats_queue.full():
-                self.stats_queue.get()
-            self.stats_queue.put(stats)
+            if res.is_final:
+                self._results.pop(req_id)
+        else:
+            self._pending_responses.setdefault(req_id, []).append(
+                self.PendingResponse(res, time.perf_counter()))
+
+        return True  # success
+
+    def dispatch_stats_task(self) -> bool:
+        if (stats := self.mp_stats_queue.get()) is None:
+            return False  # shutdown the thread
+
+        # get-stats is not urgent, so we can sleep a bit
+        time.sleep(0.1)
+        while self.stats_queue.full():
+            self.stats_queue.get()
+        self.stats_queue.put(stats)
+        return True  # success
 
     def start(self):
+
+        def mpi_done_callback(future: concurrent.futures.Future):
+            try:
+                future.result()
+            except:
+                self._error_queue.put_nowait(future.exception())
+
         self.mpi_futures = self.mpi_session.submit(
             ExecutorBindingsProxy.workers_main, **self.workers_kwargs)
+        for fut in self.mpi_futures:
+            fut.add_done_callback(mpi_done_callback)
+
         self.workers_started = True
-        self.workers_init_ok = self.result_queue.get()
-        if not self.workers_init_ok:
-            raise RuntimeError("worker initialization failed")
-        self.dispatcher.start()
+
+        self.dispatch_result_thread.start()
         self.create_stats_queue()
-        self.stats_thread.start()
+        self.dispatch_stats_thread.start()
+
+        self._handle_background_error()
 
     def shutdown(self):
         if not self.workers_started:
             return
-        if self.workers_init_ok:
-            self.request_queue.put(None)
+
+        self.request_queue.put(None)  # Tell the rank0 worker to quit
+
         for f in self.mpi_futures:
             f.result()
-        if self.dispatcher.is_alive():
-            self.result_queue.put(None)
+
+        if self.dispatch_result_thread.is_alive():
             self.dispatcher.join()
-        if self.stats_thread.is_alive():
-            self.mp_stats_queue.put(None)
-            self.stats_thread.join()
+        if self.dispatch_stats_thread.is_alive():
+            self.dispatch_stats_thread.join()
+
+        # It is possible that some requests are still pending in the workers, we need to process them before shutdown
+        self._cleanup_pending_responses(nowait=False)
+
         self.workers_started = False
+
+        # Process the errors in-case error during shutting down the threads
+        self._handle_background_error()
 
     def submit(self, request: GenerationRequest) -> GenerationResult:
         """
@@ -757,13 +1010,14 @@ class ExecutorBindingsProxy(GenerationExecutor):
 
         self.request_queue.put(request)
 
-        # Await req id.
         req_id = self.request_id_queue.get()
         request.set_id(req_id)
 
-        result = GenerationResult(request)
+        result = GenerationResult(
+            request, background_error_handler=self._handle_background_error)
         self._results[req_id] = result
-        self._request_id_dispatcher_queue.put(req_id)
+
+        self._handle_background_error()
 
         return result
 

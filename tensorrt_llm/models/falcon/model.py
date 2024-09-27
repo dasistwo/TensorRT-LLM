@@ -232,7 +232,7 @@ class FalconForCausalLM(DecoderModelForCausalLM):
         import transformers
 
         load_by_shard = kwargs.pop('load_by_shard', False)
-        load_model_on_cpu = kwargs.pop('load_model_on_cpu', False)
+        # load_model_on_cpu is ignored here, since specify target device_map will fail when workers > 1.
 
         assert hf_model_or_dir is not None
         use_preloading = isinstance(hf_model_or_dir,
@@ -257,50 +257,10 @@ class FalconForCausalLM(DecoderModelForCausalLM):
             weights = load_weights_from_hf_by_shard(hf_model_dir, config)
         else:
             hf_model = transformers.AutoModelForCausalLM.from_pretrained(
-                hf_model_dir,
-                trust_remote_code=True,
-                torch_dtype='auto',
-                device_map='auto' if not load_model_on_cpu else 'cpu')
+                hf_model_dir, torch_dtype='auto')
             weights = load_weights_from_hf_model(hf_model, config)
 
         check_share_embedding(weights, config)
         model = cls(config)
         model.load(weights)
         return model
-
-    @classmethod
-    def quantize(
-        cls,
-        hf_model_dir: str,
-        output_dir: str,
-        dtype: str = 'float16',
-        mapping: Optional[Mapping] = None,
-        quant_config: Optional[QuantConfig] = None,
-        *,
-        device: str = 'cuda',
-        calib_dataset: str = 'cnn_dailymail',
-        calib_batches: int = 512,
-        calib_batch_size: int = 1,
-        calib_max_seq_length: int = 512,
-        random_seed: int = 1234,
-        tokenizer_max_seq_length: int = 2048,
-        **kwargs,
-    ):
-        config = FalconConfig.from_hugging_face(hf_model_dir,
-                                                dtype=dtype,
-                                                mapping=mapping,
-                                                quantization=quant_config,
-                                                **kwargs)
-
-        super().quantize(hf_model_dir,
-                         output_dir,
-                         dtype=config.dtype,
-                         mapping=config.mapping,
-                         quant_config=config.quantization,
-                         device=device,
-                         calib_dataset=calib_dataset,
-                         calib_batches=calib_batches,
-                         calib_batch_size=calib_batch_size,
-                         calib_max_seq_length=calib_max_seq_length,
-                         random_seed=random_seed,
-                         tokenizer_max_seq_length=tokenizer_max_seq_length)

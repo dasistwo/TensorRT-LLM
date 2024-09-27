@@ -16,11 +16,14 @@ from typing import Optional, Tuple, Union
 
 import numpy as np
 import tensorrt as trt
+import torch
+import torch.nn.functional as F
 
 from .._common import default_net, default_trtnet
 from .._utils import str_dtype_to_np, str_dtype_to_trt
 from ..functional import (Tensor, _add_plugin_info, _create_tensor, cast, clip,
                           constant, matmul, repeat_interleave, round)
+from ..layers.linear import ColumnLinear
 from ..plugin import TRT_LLM_PLUGIN_NAMESPACE
 from .mode import QuantMode
 
@@ -585,3 +588,126 @@ def quantize_tensor(x, scale):
 
         quantized = _create_tensor(layer.get_output(0), layer)
     return quantized
+
+
+def symmetric_quantize_last_axis_of_batched_matrix(weight, quant_mode):
+    amax = weight.abs().max(dim=0)[0].to(weight.dtype)
+    if quant_mode == torch.int8:
+        scale = amax / 128.
+        qweight = torch.clamp((weight / scale).round(), -128, 127).char()
+        qweight = qweight.T.reshape(weight.shape)
+    else:
+        scale = amax / 8.
+        qweight = torch.clamp((weight / scale).round(), -8, 7).char()
+        qweight[qweight < 0] += 16
+        qweight = qweight.T.view(torch.uint8)
+        qweight = (qweight[:, 1::2] * 16 + qweight[:, ::2]).view(torch.int8)
+        qweight = qweight.reshape(weight.shape[0], weight.shape[1] // 2)
+    return qweight, scale
+
+
+def preprocess_weights_for_mixed_gemm(weight, quant_mode):
+    original_shape = weight.shape
+    if quant_mode == torch.int8:
+        return weight.T.reshape(original_shape)
+    else:
+        weight = weight.view(torch.uint8)
+        weight_quint4x2 = torch.zeros(original_shape[0],
+                                      original_shape[1] * 2).char()
+        weight_quint4x2[:, ::2] = weight // 16
+        weight_quint4x2[:, 1::2] = weight % 16
+        weight_quint4x2 = weight_quint4x2.T
+        weight_quint4x2 = weight_quint4x2[:, ::2] + weight_quint4x2[:,
+                                                                    1::2] * 16
+        row_idx = [
+            i + (1 if i % 2 == 0 else -1)
+            for i in range(weight_quint4x2.shape[0])
+        ]
+        weight_quint4x2 = weight_quint4x2[row_idx, :]
+        return weight_quint4x2.reshape(original_shape[0],
+                                       original_shape[1] // 2)
+
+
+def change_qkv_leading_dim(w, num_heads):
+    if w.dim() == 1:
+        w = w.reshape(num_heads, 3, -1)
+        w = w.transpose(0, 1).reshape(-1)
+    else:
+        shape = w.shape
+        head_dim = shape[1] // (3 * num_heads)
+        w = w.reshape(-1, num_heads, 3, head_dim)
+        w = w.transpose(1, 2).reshape(shape[0], -1)
+    return w
+
+
+def pad_like(w, target_shape, value=0):
+    if w.shape != target_shape:
+        pad_dim = []
+        for dim in range(len(target_shape)):
+            current_dim = -1 - dim
+            pad_dim.append(0)
+            pad_dim.append(
+                max(0, target_shape[current_dim] - w.shape[current_dim]))
+        res = F.pad(w, pad_dim, value=value)
+        return res
+    else:
+        return w
+
+
+def postprocess_weight_only(tllm_key, weights, quant_mode, layer):
+    if weights.dim() > 2:
+        v = weights.transpose(-1, -2)
+    else:
+        v = weights.t()
+
+    tp_dim = 1 if isinstance(layer, ColumnLinear) else 0
+    if "weight" in tllm_key:
+        if layer.is_padded:
+            split_size = layer.out_features if tp_dim == 1 else layer.in_features
+            v = torch.split(v, split_size, tp_dim)[layer.tp_rank]
+            v = pad_like(v, (layer.in_features, layer.out_features))
+        processed_torch_weights, torch_weight_scales = \
+            torch.ops.trtllm.symmetric_quantize_last_axis_of_batched_matrix(
+                v.contiguous(), quant_mode)
+        return {
+            tllm_key: processed_torch_weights,
+            tllm_key.replace("weight", "per_channel_scale"):
+            torch_weight_scales,
+        }
+    else:
+        if layer.is_padded and tp_dim == 1:
+            weights = torch.split(weights, layer.out_features,
+                                  tp_dim)[layer.tp_rank]
+            weights = pad_like(weights, (layer.out_features, ))
+        return {tllm_key: weights}  # Bias
+
+
+def postprocess_fp8_rowwise(tllm_key, weights, **kwargs):
+    if tllm_key.endswith("per_channel_scale"):
+        return {}
+
+    config = kwargs.get("config", None)
+    if weights[1] is not None:
+        assert weights[0].dtype == torch.float8_e4m3fn
+        scale = weights[1].to(torch.float32).reshape(-1)
+        return {
+            tllm_key: weights[0],
+            tllm_key.replace("weight", "per_channel_scale"): scale
+        }
+    else:
+        clamp_val = config.quantization.clamp_val
+        # activation range bound.
+        x = weights[0].to(torch.float32).clamp(clamp_val[0], clamp_val[1])
+        xmax = x.abs().max(-1, keepdim=True).values
+        # minimum scaling factor.
+        torch_weight_scales = (xmax / 448.0).clamp(min=1.0 / (448.0 * 512.0))
+        out = x / torch_weight_scales
+        torch_weight_scales = torch_weight_scales.reshape(-1)
+        out = torch.clamp(out, -448, 448)
+        processed_torch_weights = out.to(torch.float8_e4m3fn)
+        processed_torch_weights = processed_torch_weights.to(
+            torch.float8_e4m3fn)
+        return {
+            tllm_key: processed_torch_weights,
+            tllm_key.replace("weight", "per_channel_scale"): torch_weight_scales
+        }

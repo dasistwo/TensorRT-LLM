@@ -138,30 +138,6 @@ In-flight sequence batching schedules sequences in context phase together with
 sequences in generation phase to increase efficiency and reduce latency, see
 this [Document](https://nvidia.github.io/TensorRT-LLM/advanced/gpt-attention.html#in-flight-batching) for more details.
 
-### Multi-Block Mode
-
-When the following conditions are met, it is recommended to try the
-`--multi_block_mode` argument with `gptManagerBenchmark` and evaluate the impact on
-performance:
-
- 1. `input_seq_len` > 1024 (An empirically derived value that indicates that the
-    context length is long enough),
- 2. `sequence_count` * `num_head` < `multiprocessor_count` / 2
-
-Multi-block mode can be beneficial when `batch_size * num_heads` is not large
-enough to fully utilize the GPU (the number of CUDA thread blocks is low
-compared to the number of streaming multiprocessors). Hence, the multi-block
-mode is expected to reduce the latency of the multi-head attention kernel in
-the generation phase. However, it requires the context length to be long enough
-for the work performed by each CUDA thread block to remain sufficient for
-efficiency.
-
-Note that, the `--multi_block_mode` argument works more like a suggestion to the
-runtime, hence it's possible that multi-block is not used even when
-`--multi_block_mode` argument is specified due to no performance gain, and it's
-also possible that multi-block is automatically used even when `--multi_block_mode`
-argument is disabled.
-
 ### Reduce Norm Fusion
 
 There is an experimental feature called "Reduce Norm Fusion"
@@ -205,7 +181,7 @@ downside is slight reduction of accuracy because one of the quantization scaling
 factors are discarded.
 
 If both model and batch sizes are large, it is recommended to enable the feature
-by using the `--use_fused_mlp` argument with `trtllm-build`. When the workload
+by using the `--use_fused_mlp=enable` argument with `trtllm-build`. When the workload
 is very small, or if you're using FP8 PTQ and the accuracy after enabling it
 does not satisfy your requirement, it is not recommended to enable that feature.
 
@@ -217,7 +193,7 @@ the downside is slight reduction of accuracy because one of the quantization
 scaling factors are discarded.
 
 If model is large and you are running it on Hopper with FP8 precision, it is
-recommended to enable the feature by using the `--use_fused_mlp --gemm_swiglu_plugin fp8`
+recommended to enable the feature by using the `--use_fused_mlp=enable --gemm_swiglu_plugin fp8`
 argument with `trtllm-build`. When the workload is very small, or the accuracy
 after enabling it does not satisfy your requirement, it is not recommended to
 enable that feature.

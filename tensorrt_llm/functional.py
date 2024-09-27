@@ -198,6 +198,7 @@ class Tensor(object):
         # using strong reference will likely cause significant peak memory increase, since Network objects
         # holds the weights data.
         self._network = weakref.ref(default_net())
+        self.is_network_input = is_network_input
         if is_network_input:
             if dim_range is not None:
                 assert isinstance(dim_range, OrderedDict)
@@ -4062,7 +4063,7 @@ def bert_attention(tensor: Tensor,
             The maximum distance of relative position in attention, for implicit mode.
             Default value is 0, meaning to use the regular mode of relative attention bias.
             Implicit mode is only enabled when passing in non-zero positive max_distance value.
-            See relative attention bias in docs/gpt_attention.md
+            See relative attention bias in docs/source/advanced/gpt-attention.md
 
         max_input_length: Tensor = None
             The maximum input sequence length represented by Tensor shape. Requires for remove_input_padding to pre-define plugin workspace size.
@@ -4470,6 +4471,79 @@ class RopeEmbeddingUtils:
 
         return qkv
 
+    @staticmethod
+    def apply_rotary_pos_emb_cogvlm(qkv, position_embedding,
+                                    num_attention_heads, attention_head_size,
+                                    max_position_embeddings,
+                                    rotary_embedding_scale,
+                                    remove_input_padding) -> Tensor:
+        input = qkv[0] if isinstance(qkv, list) else qkv
+        input_shape = shape(input)
+        batch_size = 1 if remove_input_padding else shape(input, 0)
+        seqlen = shape(input, 0 if remove_input_padding else 1)
+        if isinstance(qkv, list):
+            query, key, value = qkv
+        else:
+            qkv = qkv.view(
+                concat([
+                    batch_size,
+                    seqlen,
+                    3,
+                    num_attention_heads,
+                    attention_head_size,
+                ]))
+            query, key, value = split(qkv, 1, dim=2)
+        q_shape = concat([
+            batch_size,
+            seqlen,
+            num_attention_heads,
+            attention_head_size,
+        ])
+        query = query.view(q_shape)
+        key = key.view(q_shape)
+        value = value.view(q_shape)
+
+        embedding_weight = RopeEmbeddingUtils.create_sinusoidal_positions(
+            max_position_embeddings, attention_head_size).squeeze(0)
+        embedding_weight /= rotary_embedding_scale  # [max_position_embeddings, attention_head_size]
+
+        if remove_input_padding:
+            position_embedding = unsqueeze(position_embedding, 0)  # [1, seqlen]
+
+        embedding_weight = constant(embedding_weight)  # float32
+        position_embedding = embedding(
+            position_embedding,
+            embedding_weight)  # [1, seqlen, attention_head_size]
+        sin, cos = split(position_embedding, attention_head_size // 2,
+                         dim=-1)  # [1, seqlen, attention_head_size//2]
+
+        input_dtype = query.dtype
+        fp32_query = cast(query, "float32")
+        fp32_key = cast(key, "float32")
+        fp32_query = RopeEmbeddingUtils.apply_rotary_pos_emb(
+            tensor=fp32_query,
+            position_embedding=[cos, sin],
+            pos_emb_type=PositionEmbeddingType.rope_gpt_neox)
+        fp32_key = RopeEmbeddingUtils.apply_rotary_pos_emb(
+            tensor=fp32_key,
+            position_embedding=[cos, sin],
+            pos_emb_type=PositionEmbeddingType.rope_gpt_neox)
+
+        query = cast(fp32_query, input_dtype)
+        key = cast(fp32_key, input_dtype)
+
+        if isinstance(qkv, list):
+            qkv = [
+                query.view(input_shape),
+                key.view(input_shape),
+                value.view(input_shape),
+            ]
+        else:
+            qkv = concat([query, key, value], dim=2)
+            qkv = qkv.view(input_shape)
+
+        return qkv
+
 
 @gw.record_signature
 def gpt_attention(
@@ -4545,19 +4619,19 @@ def gpt_attention(
     arguments that are likely to be removed or merged with others in the future
     release.
 
-    See docs/gpt_attention.md for the documentation of that function.
+    See docs/source/advanced/gpt-attention.md for the documentation of that function.
 
     Parameters:
         qkv: Tensor (On GPU)
             The input QKV tensor. Its shape is [batch_beam_size, max_seqlen, qkv_dim] in padded mode and [1, num_tokens, qkv_dim] in
-            packed mode. Where qkv_dim depends on using MQA, GQA, or MHA. See QKV Input in docs/gpt_attention.md,
+            packed mode. Where qkv_dim depends on using MQA, GQA, or MHA. See QKV Input in docs/source/advanced/gpt-attention.md,
 
         past_key_value: Tensor (On GPU)
             The tensor that stores KV cache data. Its shape is
             [max_batch_size * max_beam_width, 2, num_kv_heads, max_seqlen, hidden_dim_per_head]
             in contiguous mode and
             [max_blocks, 2, num_kv_heads, num_tokens_per_block, hidden_dim_per_head]
-            in paged mode. See KV Cache in docs/gpt_attention.md,
+            in paged mode. See KV Cache in docs/source/advanced/gpt-attention.md,
 
         context_fmha_custom_mask: Tensor (On GPU)
             The tensor that stores the packed custom mask for fmha.
@@ -4565,7 +4639,7 @@ def gpt_attention(
 
         sequence_lengths: Tensor (On GPU)
             The tensor that stores the length of each sequence. Its shape is
-            [batch_size]. See QKV Input in docs/gpt_attention.md,
+            [batch_size]. See QKV Input in docs/source/advanced/gpt-attention.md,
 
         host_past_key_value_lengths: Tensor (On CPU)
             An INT32 tensor of shape [batch_size],
@@ -4583,12 +4657,12 @@ def gpt_attention(
         cache_indirection: Tensor (On GPU)
             The tensor to reconstruct the paths when using beam-search. Its
             shape is [batch_size, beam_width, max_seqlen]. See Beam-Search in
-            docs/gpt_attention.md,
+            docs/source/advanced/gpt-attention.md,
 
         host_request_types: Tensor = None (On CPU)
             The tensor on the host that indicates if a request is in context or
             generation phase. Its shape is [batch_size]. See Inflight Batching
-            in docs/gpt_attention.md,
+            in docs/source/advanced/gpt-attention.md,
 
         layer_idx: int
             The index of this attention layer, used to access kv_cache_block_offsets,
@@ -4604,7 +4678,7 @@ def gpt_attention(
 
         q_scaling: float
             The value used to compute the scaling factor applied to the output
-            of the Q*K^T product. See Scaling Factors in docs/gpt_attention.md,
+            of the Q*K^T product. See Scaling Factors in docs/source/advanced/gpt-attention.md,
 
         qk_tanh_scale: float
             The scale * tanh(value / scale) used to compute the scaling factor applied to the output
@@ -4652,12 +4726,12 @@ def gpt_attention(
         kv_orig_quant_scale: Tensor
             The tensor to store the scaling factor for quantization to INT8/FP8
             in the KV cache. Its shape is [1]. See INT8/FP8 KV Cache in
-            docs/gpt_attention.md,
+            docs/source/advanced/gpt-attention.md,
 
         kv_quant_orig_scale: Tensor
             The tensor to store the scaling factor for dequantization from
             INT8/FP8 in the KV cache. Its shape is [1]. See INT8/FP8 KV Cache
-            in docs/gpt_attention.md,
+            in docs/source/advanced/gpt-attention.md,
 
         attention_output_orig_quant_scale: Tensor
             The tensor to store the scaling factor for quantization to FP8
@@ -4668,7 +4742,7 @@ def gpt_attention(
 
         max_context_length: int32_t
             The length of the longest input sequence. See QKV Input in
-            docs/gpt_attention.md,
+            docs/source/advanced/gpt-attention.md,
 
         mask_type: int = 1
             The type of mask:
@@ -4705,14 +4779,14 @@ def gpt_attention(
         kv_cache_block_offsets:
             The tensor of block offsets for the KV cache. Its shape is
             [num_layers, max_batch_size, max_beam_width, 2, max_blocks_per_sequence * 2],
-            See KV cache section in docs/gpt_attention.md, on gpu,
+            See KV cache section in docs/source/advanced/gpt-attention.md, on gpu,
 
         host_kv_cache_block_offsets:
             The same as kv_cache_block_offsets, but on cpu,
 
         host_kv_cache_pool_pointers:
             The tensor of pool pointers for the KV cache. Its shape is [2],
-            See KV cache section in docs/gpt_attention.md, on gpu,
+            See KV cache section in docs/source/advanced/gpt-attention.md, on gpu,
 
         do_cross_attention: bool = False
             Do we use this as cross attention instead of self attention,
@@ -4735,7 +4809,7 @@ def gpt_attention(
             The maximum distance of relative position in attention, for implicit mode.
             Default value is 0, meaning to use the regular mode of relative attention bias.
             Implicit mode is only enabled when passing in non-zero positive max_distance value.
-            See relative attention bias in docs/gpt_attention.md
+            See relative attention bias in docs/source/advanced/gpt-attention.md
 
         host_context_lengths: Tensor = None (On CPU)
             A host tensor that contains the lengths of the different inputs,
@@ -4912,8 +4986,7 @@ def gpt_attention(
     tp_rank = trt.PluginField("tp_rank", np.array(tp_rank, dtype=np.int32),
                               trt.PluginFieldType.INT32)
     kv_cache_quant_mode_field = trt.PluginField(
-        "kv_cache_quant_mode",
-        np.array(np.int8(kv_cache_quant_mode), dtype=np.int32),
+        "kv_cache_quant_mode", np.array(kv_cache_quant_mode, dtype=np.int32),
         trt.PluginFieldType.INT32)
     paged_kv_cache = trt.PluginField(
         "paged_kv_cache", np.array(paged_kv_cache_flag, dtype=np.int32),
@@ -5456,6 +5529,7 @@ ACT2FN = {
     'gelu_new': gelu,
     'gelu_fast': gelu,
     'gelu_pytorch_tanh': gelu,
+    'openai-gelu': gelu,
     'geglu': geglu,
     'gegelu': gegelu,
     'identity': identity,
@@ -5518,7 +5592,6 @@ def lora_plugin(
     transa: bool = False,
     transb: bool = False,
     host_context_lengths: Tensor = None,  # for pad-free input mode
-    max_num_tokens: int = 0,
     max_low_rank: int = 0,
     lora_ranks: List[Tensor] = None,
     lora_weights_pointers: List[Tensor] = None,
@@ -5526,8 +5599,8 @@ def lora_plugin(
 ):
     '''
     Parameters:
-        lora_ids : cpu Tensor = None
-            A tensor that contains the lora ids of different inputs.
+        input : Tensor (On GPU)
+            The input tensor. Its shape is [batch_size, seq_len, dim] or [num_tokens, dim] for remove_input_padding
 
         in_hidden_size/out_hidden_size : int
             the lora computation workflow is
@@ -5536,7 +5609,7 @@ def lora_plugin(
         host_request_types : Tensor = None
             The tensor on the host that indicates if a request is in context or
             generation phase. Its shape is [batch_size]. See Inflight Batching
-            in docs/gpt_attention.md,
+            in docs/source/advanced/gpt-attention.md,
 
         transa : bool
             Is the first input transposed? Set to 'True' if you want the first
@@ -5548,9 +5621,6 @@ def lora_plugin(
 
         host_context_lengths: cpu Tensor = None
             A host tensor that contains the lengths of the different inputs,
-
-        max_num_tokens : int
-            Maximum number of tokens, used to determine the workspace size.
 
         max_low_rank : int
             Maximum low_rank, used to determine the workspace size.
@@ -5599,9 +5669,6 @@ def lora_plugin(
         "remove_input_padding",
         np.array(np.int8(default_net().plugin_config.remove_input_padding),
                  dtype=np.int8), trt.PluginFieldType.INT8)
-    max_num_tokens_field = trt.PluginField(
-        "max_num_tokens", np.array(max_num_tokens, dtype=np.int32),
-        trt.PluginFieldType.INT32)
     max_low_rank_field = trt.PluginField("max_low_rank",
                                          np.array(max_low_rank, dtype=np.int32),
                                          trt.PluginFieldType.INT32)
@@ -5615,8 +5682,7 @@ def lora_plugin(
 
     pfc = trt.PluginFieldCollection([
         in_hidden_size_field, transa, transb, num_lora_modules_field, pf_type,
-        remove_input_padding, max_num_tokens_field, max_low_rank_field,
-        weight_index_field
+        remove_input_padding, max_low_rank_field, weight_index_field
     ] + out_hidden_size_field_list)
     lora_plug = plg_creator.create_plugin("lora", pfc)
 
@@ -5670,7 +5736,7 @@ def mamba_conv1d(input: Tensor,
         host_request_types : Tensor (On CPU)
             The tensor on the host that indicates if a request is in context or
             generation phase. Its shape is [batch_size]. See Inflight Batching
-            in docs/gpt_attention.md,
+            in docs/source/advanced/gpt-attention.md,
 
         last_token_ids : Tensor (On GPU)
             The inclusive prefix-sum of the lengths or the lengths of the
@@ -5817,7 +5883,7 @@ def selective_scan(input: Tensor,
         host_request_types : Tensor (On CPU)
             The tensor on the host that indicates if a request is in context or
             generation phase. Its shape is [batch_size]. See Inflight Batching
-            in docs/gpt_attention.md
+            in docs/source/advanced/gpt-attention.md
 
         last_token_ids : Tensor (On GPU)
             The inclusive prefix-sum of the lengths or the lengths of the
@@ -5963,7 +6029,7 @@ def rg_lru(input: Tensor,
         host_request_types : Tensor (On CPU)
             The tensor on the host that indicates if a request is in context or
             generation phase. Its shape is [batch_size]. See Inflight Batching
-            in docs/gpt_attention.md,
+            in docs/source/advanced/gpt-attention.md,
 
         last_token_ids : Tensor (On GPU)
             The inclusive prefix-sum of the lengths or the lengths of the
@@ -6190,3 +6256,47 @@ def scatter_nd(input: Tensor, mask: Tensor, source: Tensor) -> Tensor:
                                                  source.trt_tensor,
                                                  mode=trt.ScatterMode.ND)
     return _create_tensor(scatter_layer.get_output(0), scatter_layer)
+
+
+def low_latency_gemm(input: Tensor,
+                     mat2: Tensor,
+                     alpha: Optional[np.ndarray] = None,
+                     strict_dtype: Optional[trt.DataType] = None) -> Tensor:
+    if not default_net().plugin_config.low_latency_gemm_plugin:
+        raise RuntimeError("Low Latency GEMM is only support with plugin")
+    elif default_net().plugin_config.low_latency_gemm_plugin != "fp8":
+        raise RuntimeError("Low Latency GEMM plugin only support fp8")
+    else:
+        plg_creator = trt.get_plugin_registry().get_plugin_creator(
+            "LowLatencyGemm", "1", TRT_LLM_PLUGIN_NAMESPACE)
+        assert plg_creator is not None
+        if ((input.dtype != trt.fp8) or ((mat2.dtype) != trt.fp8)):
+            raise TypeError("Low Latency GEMM only support fp8 input")
+        if (alpha):
+            assert (isinstance(alpha, np.ndarray) and alpha.dtype == np.float32
+                    and alpha.size
+                    == 1), "`alpha` must be passed as a float32 ndarray"
+        alpha = alpha if alpha else np.array(1.0, dtype=np.float32)
+        alpha = trt.PluginField("alpha", alpha.flatten(),
+                                trt.PluginFieldType.FLOAT32)
+
+        if strict_dtype is not None:
+            assert isinstance(strict_dtype, trt.DataType)
+            p_dtype = strict_dtype
+            if (p_dtype not in [trt.float32, trt.float16, trt.bfloat16]):
+                raise ValueError(
+                    "strict_dtype must be float32, float16 or bfloat16 in low latency gemm plugin"
+                )
+        else:
+            raise RuntimeError(
+                "need to use strict dtype in  low latency gemm plugin fp8")
+        pf_type = trt.PluginField("type_id", np.array([int(p_dtype)], np.int32),
+                                  trt.PluginFieldType.INT32)
+        pfc = trt.PluginFieldCollection([alpha, pf_type])
+        low_latency_gemm_plug = plg_creator.create_plugin(
+            "low_latency_gemm", pfc)
+        plug_inputs = [input.trt_tensor, mat2.trt_tensor]
+        layer = default_trtnet().add_plugin_v2(plug_inputs,
+                                               low_latency_gemm_plug)
+        _add_plugin_info(layer, plg_creator, "low_latency_gemm", pfc)
+        return _create_tensor(layer.get_output(0), layer)

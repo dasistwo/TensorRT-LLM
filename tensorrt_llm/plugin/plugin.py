@@ -19,11 +19,12 @@ from collections import OrderedDict
 from dataclasses import asdict, dataclass, field, fields
 from enum import IntEnum
 from pathlib import Path
+from textwrap import dedent
 from typing import List, Optional, Tuple
 
 import tensorrt as trt
 
-from .._ipc_utils import IpcMemory
+from .._ipc_utils import IpcMemory, can_access_peer
 from ..logger import logger
 from ..mapping import Mapping
 
@@ -38,7 +39,8 @@ def plugin_lib_path() -> str:
 
 
 def _load_plugin_lib():
-    winmode = 0 if platform.system() == "Windows" else None
+    on_windows = platform.system() == "Windows"
+    winmode = 0 if on_windows else None
     handle = ctypes.CDLL(plugin_lib_path(),
                          mode=ctypes.RTLD_GLOBAL,
                          winmode=winmode)
@@ -47,8 +49,21 @@ def _load_plugin_lib():
         handle.initTrtLlmPlugins.restype = ctypes.c_bool
     except AttributeError as err:
         raise ImportError('TensorRT-LLM Plugin is unavailable') from err
-    assert handle.initTrtLlmPlugins(None,
-                                    TRT_LLM_PLUGIN_NAMESPACE.encode('utf-8'))
+
+    try:
+        assert handle.initTrtLlmPlugins(
+            None, TRT_LLM_PLUGIN_NAMESPACE.encode('utf-8'))
+    except OSError as e:
+        windows_err = """
+        The error above may be caused by an outdated Microsoft Visual C++ Redistributable Version.
+        Please install the latest MSVC from the link below and re-launch.
+
+        https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist?view=msvc-170#latest-microsoft-visual-c-redistributable-version
+        """
+        err_msg = dedent(windows_err if on_windows else "Unknown error")
+        raise RuntimeError(err_msg) from e
+    except Exception as e:
+        raise e
 
 
 class ContextFMHAType(IntEnum):
@@ -65,7 +80,8 @@ DEFAULT_PLUGIN_DTYPE_OPTIONS = [
 PLUGIN_DTYPE_OPTIONS_MAP = {
     "gemm_swiglu_plugin": ["fp8", None],
     "gemm_plugin":
-    ["auto", "float16", "float32", "bfloat16", "int32", "fp8", None]
+    ["auto", "float16", "float32", "bfloat16", "int32", "fp8", None],
+    "low_latency_gemm_plugin": ["fp8", None],
 }
 
 
@@ -155,12 +171,13 @@ class PluginConfig(metaclass=PluginConfigMeta):
     _quantize_tensor_plugin: bool = field(default=False, init=False)
     _moe_plugin: Optional[str] = field(default="auto", init=False)
     _mamba_conv1d_plugin: Optional[str] = field(default="auto", init=False)
+    _low_latency_gemm_plugin: Optional[str] = field(default=None, init=False)
 
     # Features
     _context_fmha: bool = field(default=True, init=False)
     _bert_context_fmha_fp32_acc: bool = field(
         default=False, init=False)  # will use fp16 if disabled
-    _paged_kv_cache: bool = field(default=True, init=False)
+    _paged_kv_cache: Optional[bool] = field(default=None, init=False)
     _remove_input_padding: bool = field(default=True, init=False)
     _reduce_fusion: bool = field(default=False, init=False)
     _enable_xqa: bool = field(default=True, init=False)
@@ -170,12 +187,15 @@ class PluginConfig(metaclass=PluginConfigMeta):
     _multiple_profiles: bool = field(default=False, init=False)
     _paged_state: bool = field(default=True, init=False)
     _streamingllm: bool = field(default=False, init=False)
+    _manage_weights: bool = field(default=False, init=False)
+    _use_fused_mlp: bool = field(default=True, init=False)
 
     def update_from_dict(self, config: dict):
         for name in config.keys():
             if hasattr(self, name):
                 value_to_be_update = config[name]
-                if isinstance(getattr(self, name), bool):
+                if isinstance(getattr(self, name),
+                              bool) or name == 'paged_kv_cache':
                     if value_to_be_update == "enable":
                         value_to_be_update = True
                     elif value_to_be_update == "disable":
@@ -202,7 +222,7 @@ class PluginConfig(metaclass=PluginConfigMeta):
 
     def to_legacy_setting(self):
         '''Legacy setting means that all of the plugins and features are
-        disabled, this needed for the legacy `build.py` script, which will be
+        disabled, this is needed for the legacy `build.py` script, which will be
         migrated to the centralized building script `tensorrt_llm/commands/build.py`.
 
         After the migration is done, this function may or may not be deleted.
@@ -214,7 +234,7 @@ class PluginConfig(metaclass=PluginConfigMeta):
                 continue
             if field.type in (str, Optional[str]):
                 setattr(self, field_name, None)
-            elif field.type == bool:
+            elif field.type == bool or field_name == 'paged_kv_cache':
                 setattr(self, field_name, False)
 
     @property
@@ -282,11 +302,11 @@ cli_plugin_args = [
     "moe_plugin",
     "mamba_conv1d_plugin",
     "nccl_plugin",
+    "low_latency_gemm_plugin",
 
     # Features
     "context_fmha",
     "bert_context_fmha_fp32_acc",
-    "paged_kv_cache",
     "remove_input_padding",
     "enable_xqa",
     "tokens_per_block",
@@ -295,11 +315,12 @@ cli_plugin_args = [
     "multiple_profiles",
     "paged_state",
     "streamingllm",
-    "reduce_fusion"
+    "reduce_fusion",
+    "use_fused_mlp",
 ]
 
 
-def add_plugin_argument(parser):
+def add_plugin_argument(parser: argparse.ArgumentParser):
     plugin_config = PluginConfig()
     for field in fields(plugin_config):
         # Remove prefix "_" of the storage name
@@ -315,19 +336,20 @@ def add_plugin_argument(parser):
                 type=str,
                 default=field.default if field.default else "disable",
                 choices=[x if x else "disable" for x in plugin_dtype_options],
-                help=f"Whether to enable/disable {field_name} and the dtype.")
+                help=f"Whether to enable/disable ``{field_name}`` and the dtype."
+            )
         elif field.type == bool:
             parser.add_argument(
                 "--" + field_name,
                 type=str,
                 default="enable" if field.default else "disable",
                 choices=["enable", "disable"],
-                help=f"Whether to enable/disable {field_name}.")
+                help=f"Whether to enable/disable ``{field_name}``.")
         else:
             parser.add_argument("--" + field_name,
                                 type=field.type,
                                 default=field.default,
-                                help=f"{field_name}.")
+                                help=f"``{field_name}``.")
     return parser
 
 
@@ -377,10 +399,9 @@ class CustomAllReduceHelper:
 
     @staticmethod
     def allocate_workspace(mapping: Mapping,
-                           size: int,
-                           is_p2p_supported: bool = True
-                           ) -> Tuple[List[IpcMemory], "torch.tensor"]:
+                           size: int) -> Tuple[List[IpcMemory], "torch.tensor"]:
         import torch
+        is_p2p_supported = can_access_peer(mapping)
         ipc_buffers_ping = IpcMemory(mapping, size * mapping.tp_size,
                                      is_p2p_supported)
         ipc_buffers_pong = IpcMemory(mapping, size * mapping.tp_size,

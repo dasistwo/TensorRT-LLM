@@ -18,6 +18,7 @@
 
 #include "tensorrt_llm/common/arrayView.h"
 #include "tensorrt_llm/common/dataType.h"
+#include "tensorrt_llm/kernels/decodingCommon.h"
 #include "tensorrt_llm/kernels/kvCacheIndex.h"
 
 #include <NvInferRuntime.h>
@@ -46,7 +47,8 @@ enum class MemoryType : std::int32_t
     kGPU = 0,
     kCPU = 1,
     kPINNED = 2,
-    kUVM = 3
+    kUVM = 3,
+    kPINNEDPOOL = 4
 };
 
 template <MemoryType T>
@@ -76,6 +78,12 @@ template <>
 struct MemoryTypeString<MemoryType::kUVM>
 {
     static auto constexpr value = "UVM";
+};
+
+template <>
+struct MemoryTypeString<MemoryType::kPINNEDPOOL>
+{
+    static auto constexpr value = "PINNEDPOOL";
 };
 
 //! \brief For converting a TensorRT data type to a C++ data type.
@@ -317,6 +325,12 @@ struct TRTDataType<kernels::KVCacheIndex>
 };
 
 template <>
+struct TRTDataType<kernels::FinishedState>
+{
+    static constexpr auto value = TRTDataType<kernels::FinishedState::UnderlyingType>::value;
+};
+
+template <>
 struct TRTDataType<void*>
 {
     static constexpr auto value = BufferDataType::kTrtPointerType;
@@ -407,14 +421,14 @@ public:
     //!
     [[nodiscard]] virtual DataType getDataType() const = 0;
 
-    virtual char const* getDataTypeName() const;
+    [[nodiscard]] virtual char const* getDataTypeName() const;
 
     //!
     //! \brief Returns the memory type of the buffer.
     //!
     [[nodiscard]] virtual MemoryType getMemoryType() const = 0;
 
-    virtual char const* getMemoryTypeName() const;
+    [[nodiscard]] virtual char const* getMemoryTypeName() const;
 
     //!
     //! \brief Resizes the buffer. This is a no-op if the new size is smaller than or equal to the current capacity.
@@ -622,7 +636,7 @@ T* bufferCastOrNull(std::optional<IBuffer::SharedPtr> const& optionalBufferPtr)
         return bufferCast<T>(*optionalBufferPtr.value());
     }
 
-    return (T*) nullptr;
+    return static_cast<T*>(nullptr);
 }
 
 /// @brief Retrieves a T const typed pointer to the underlying data of the buffer pointed to by the buffer pointer
@@ -638,7 +652,7 @@ T const* bufferCastOrNull(std::optional<IBuffer::SharedConstPtr> const& optional
         return bufferCast<T>(*optionalBufferPtr.value());
     }
 
-    return (T const*) nullptr;
+    return static_cast<T const*>(nullptr);
 }
 
 template <typename T>

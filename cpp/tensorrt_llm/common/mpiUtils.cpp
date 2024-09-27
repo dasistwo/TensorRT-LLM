@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <numeric>
+#include <unordered_set>
 
 #include "tensorrt_llm/common/mpiUtils.h"
 
@@ -27,6 +28,7 @@
 #include <csignal>
 #include <cstdlib>
 #include <mutex>
+#include <thread>
 #include <type_traits>
 #ifndef _WIN32
 #include <unistd.h>
@@ -126,11 +128,10 @@ std::vector<int> getWorldRanks(MpiComm const& comm)
     MPICHECK(MPI_Group_translate_ranks(group, groupSize, ranks.data(), worldGroup, worldRanks.data()));
     MPICHECK(MPI_Group_free(&group));
     MPICHECK(MPI_Group_free(&worldGroup));
-    std::sort(worldRanks.begin(), worldRanks.end());
-    return worldRanks;
 #else
-    TLLM_THROW("Multi device support is disabled.");
+    std::vector<int> worldRanks{0};
 #endif
+    return worldRanks;
 }
 
 void initialize(MpiThreadSupport threadMode, bool forwardAbortToParent)
@@ -234,12 +235,14 @@ void MpiComm::bcast(runtime::IBuffer& buf, int root) const
 
 std::shared_ptr<MpiRequest> MpiComm::sendAsync(void const* buffer, size_t size, MpiType dtype, int dest, int tag) const
 {
+    TLLM_LOG_DEBUG("start MPI_Isend with size %d", size);
     std::shared_ptr<MpiRequest> r = std::make_shared<MpiRequest>();
 #if ENABLE_MULTI_DEVICE
     MPICHECK(MPI_Isend(buffer, size, getMpiDtype(dtype), dest, tag, mComm, &r->mRequest));
 #else
     TLLM_THROW("Multi device support is disabled.");
 #endif
+    TLLM_LOG_DEBUG("end MPI_Isend with size %d", size);
     return r;
 }
 
@@ -250,11 +253,13 @@ std::shared_ptr<MpiRequest> MpiComm::sendAsync(runtime::IBuffer const& buf, int 
 
 void MpiComm::send(void const* buffer, size_t size, MpiType dtype, int dest, int tag) const
 {
+    TLLM_LOG_DEBUG("start MPI_Send with size %d", size);
 #if ENABLE_MULTI_DEVICE
     MPICHECK(MPI_Send(buffer, size, getMpiDtype(dtype), dest, tag, mComm));
 #else
     TLLM_THROW("Multi device support is disabled.");
 #endif // ENABLE_MULTI_DEVICE
+    TLLM_LOG_DEBUG("end MPI_Send with size %d", size);
 }
 
 void MpiComm::send(runtime::IBuffer const& buf, int dest, int tag) const
@@ -264,12 +269,14 @@ void MpiComm::send(runtime::IBuffer const& buf, int dest, int tag) const
 
 MPI_Status MpiComm::recv(void* buffer, size_t size, MpiType dtype, int source, int tag) const
 {
+    TLLM_LOG_DEBUG("start MPI_Recv with size %d", size);
     MPI_Status status{};
 #if ENABLE_MULTI_DEVICE
     MPICHECK(MPI_Recv(buffer, size, getMpiDtype(dtype), source, tag, mComm, &status));
 #else
     TLLM_THROW("Multi device support is disabled.");
 #endif // ENABLE_MULTI_DEVICE
+    TLLM_LOG_DEBUG("end MPI_Recv with size %d", size);
     return status;
 }
 
@@ -314,6 +321,27 @@ void MpiComm::mprobe(int source, int tag, MPI_Message* msg, MPI_Status* status) 
 #else
     TLLM_THROW("Multi device support is disabled.");
 #endif // ENABLE_MULTI_DEVICE
+}
+
+bool MpiComm::iprobe(int source, int tag, MPI_Status* status) const
+{
+#if ENABLE_MULTI_DEVICE
+    int flag{0};
+    MPICHECK(MPI_Iprobe(source, tag, mComm, &flag, status));
+    return flag != 0;
+#else
+    TLLM_THROW("Multi device support is disabled.");
+    return false;
+#endif
+}
+
+void MpiComm::recvPoll(int source, int tag, int periodMs) const
+{
+    MPI_Status status;
+    while (!iprobe(source, tag, &status))
+    {
+        std::this_thread::sleep_for(std::chrono::milliseconds(periodMs));
+    }
 }
 
 int MpiComm::getRank() const
@@ -363,31 +391,30 @@ MpiComm& MpiComm::mutableLocalSession()
 void MpiComm::refreshLocalSession()
 {
 #if ENABLE_MULTI_DEVICE
-    static std::vector<int> initSessionRanks;
     static std::mutex mutex;
     std::unique_lock lock(mutex);
-    if (initSessionRanks.empty())
-    {
-        auto initSessionRanks = getWorldRanks(MpiComm::session());
-        auto localSessionRanks = getWorldRanks(MpiComm::localSession());
-        std::vector<int> intersectionRanks;
-        std::set_intersection(initSessionRanks.begin(), initSessionRanks.end(), localSessionRanks.begin(),
-            localSessionRanks.end(), std::back_inserter(intersectionRanks));
+    auto initSessionRanks = getWorldRanks(MpiComm::session());
+    auto localSessionRanks = getWorldRanks(MpiComm::localSession());
 
-        MPI_Group worldGroup;
-        MPICHECK(MPI_Comm_group(MPI_COMM_WORLD, &worldGroup));
-        MPI_Group localGroup;
-        MPICHECK(MPI_Group_incl(worldGroup, intersectionRanks.size(), intersectionRanks.data(), &localGroup));
-        MPI_Comm localComm;
-        MPICHECK(MPI_Comm_create_group(MPI_COMM_WORLD, localGroup, intersectionRanks.front(), &localComm));
-        MpiComm::mutableLocalSession().mFreeComm = true;
-        MpiComm::mutableLocalSession() = MpiComm{localComm, false};
-    }
-    else
+    // Add to intersectionRanks in order of initSessionRanks
+    std::vector<int> intersectionRanks;
+    std::unordered_set<int> localSessionRanksSet(localSessionRanks.begin(), localSessionRanks.end());
+    for (auto rank : initSessionRanks)
     {
-        TLLM_CHECK_WITH_INFO(getWorldRanks(MpiComm::session()) == initSessionRanks,
-            "Executors in the same process must use the same participant IDs.");
+        if (localSessionRanksSet.find(rank) != localSessionRanksSet.end())
+        {
+            intersectionRanks.push_back(rank);
+        }
     }
+
+    MPI_Group worldGroup;
+    MPICHECK(MPI_Comm_group(MPI_COMM_WORLD, &worldGroup));
+    MPI_Group localGroup;
+    MPICHECK(MPI_Group_incl(worldGroup, intersectionRanks.size(), intersectionRanks.data(), &localGroup));
+    MPI_Comm localComm;
+    MPICHECK(MPI_Comm_create_group(MPI_COMM_WORLD, localGroup, intersectionRanks.front(), &localComm));
+    MpiComm::mutableLocalSession().mFreeComm = true;
+    MpiComm::mutableLocalSession() = MpiComm{localComm, false};
     TLLM_LOG_INFO("Refreshed the MPI local session");
 #endif // ENABLE_MULTI_DEVICE
 }
